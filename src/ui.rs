@@ -12,6 +12,7 @@ use crate::lvgl;
 
 const MAX_VISIBLE_ENTRIES: usize = 300;
 const MAX_SEARCH_RESULTS: usize = 200;
+const FILE_THUMBNAIL_SIZE: u32 = 28;
 const SAVE_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,6 +31,7 @@ struct UiState {
     filter_mode: ResourceFilter,
     selected_path: Option<String>,
     preview_uri: Option<String>,
+    thumbnail_cache: BTreeMap<String, Option<String>>,
     replacements: BTreeMap<String, Vec<u8>>,
     theme_id: String,
     pack_name: String,
@@ -56,6 +58,7 @@ fn ui_state() -> &'static Mutex<UiState> {
             filter_mode: ResourceFilter::All,
             selected_path: None,
             preview_uri: None,
+            thumbnail_cache: BTreeMap::new(),
             replacements: BTreeMap::new(),
             theme_id: "conora".into(),
             pack_name: "Conora Resource Pack".into(),
@@ -80,6 +83,7 @@ struct UiSnapshot {
     search_query: String,
     filter_mode: ResourceFilter,
     entries: Vec<BrowserEntry>,
+    thumbnail_uris: BTreeMap<String, String>,
     hidden_entries: usize,
     selected_path: Option<String>,
     selected_size: Option<usize>,
@@ -101,7 +105,7 @@ struct UiSnapshot {
     error: Option<String>,
 }
 
-fn snapshot(state: &UiState) -> UiSnapshot {
+fn snapshot(state: &mut UiState) -> UiSnapshot {
     let (file_count, image_count, entries, hidden_entries) = if let Some(firmware) = &state.firmware {
         let total_files = firmware.file_count();
         let total_images = firmware.image_count();
@@ -212,6 +216,50 @@ fn snapshot(state: &UiState) -> UiSnapshot {
         (0, 0, Vec::new(), 0)
     };
 
+    state.thumbnail_cache.retain(|path, _| {
+        entries
+            .iter()
+            .any(|entry| entry.image.is_some() && entry.path.as_str() == path.as_str())
+    });
+    let missing_firmware_thumbnails = entries
+        .iter()
+        .filter(|entry| {
+            entry.image.is_some()
+                && !state.replacements.contains_key(&entry.path)
+                && !state.thumbnail_cache.contains_key(&entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    let mut generated_thumbnails = state
+        .firmware
+        .as_ref()
+        .and_then(|firmware| {
+            firmware
+                .file_thumbnail_pngs(&missing_firmware_thumbnails, FILE_THUMBNAIL_SIZE)
+                .ok()
+        })
+        .unwrap_or_default();
+    let mut thumbnail_uris = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| entry.image.is_some()) {
+        if !state.thumbnail_cache.contains_key(&entry.path) {
+            let thumbnail_uri = state
+                .replacements
+                .get(&entry.path)
+                .and_then(|bytes| thumbnail_from_bytes(bytes))
+                .or_else(|| {
+                    generated_thumbnails
+                        .remove(&entry.path)
+                        .map(thumbnail_uri_from_png)
+                });
+            state
+                .thumbnail_cache
+                .insert(entry.path.clone(), thumbnail_uri);
+        }
+        if let Some(Some(uri)) = state.thumbnail_cache.get(&entry.path) {
+            thumbnail_uris.insert(entry.path.clone(), uri.clone());
+        }
+    }
+
     let selected = state
         .selected_path
         .as_deref()
@@ -247,6 +295,7 @@ fn snapshot(state: &UiState) -> UiSnapshot {
         search_query: state.search_query.clone(),
         filter_mode: state.filter_mode,
         entries,
+        thumbnail_uris,
         hidden_entries,
         selected_path: state.selected_path.clone(),
         selected_size,
@@ -527,6 +576,7 @@ async fn begin_firmware_pick() {
                 state.selected_path = None;
                 state.preview_uri = None;
                 state.replacements.clear();
+                state.thumbnail_cache.clear();
                 if !target.is_empty() {
                     state.target = target;
                 }
@@ -625,6 +675,7 @@ async fn begin_crpack_pick() {
 
             // Strategy B: completely reset existing replacements and use the imported ones
             state.replacements = unpacked.replacements;
+            state.thumbnail_cache.clear();
             state.filter_mode = ResourceFilter::Replaced;
             state.search_query.clear();
             state.busy = false;
@@ -751,6 +802,7 @@ async fn begin_png_pick() {
                 let (preview_uri, preview_error) = preview_from_bytes(&encoded.bytes);
                 let mut state = lock_state();
                 state.replacements.insert(path.clone(), encoded.bytes);
+                state.thumbnail_cache.remove(&path);
                 state.selected_path = Some(path.clone());
                 state.preview_uri = preview_uri;
                 state.busy = false;
@@ -838,6 +890,7 @@ async fn begin_binary_pick() {
         } else {
             let (preview_uri, preview_error) = preview_from_bytes(&picked.data);
             state.replacements.insert(path.clone(), picked.data);
+            state.thumbnail_cache.remove(&path);
             state.selected_path = Some(path);
             state.preview_uri = preview_uri;
             state.busy = false;
@@ -864,6 +917,7 @@ fn restore_selected() {
             return;
         };
         state.replacements.remove(&path);
+        state.thumbnail_cache.remove(&path);
         let original = state
             .firmware
             .as_ref()
@@ -1214,6 +1268,15 @@ fn png_file_name(file_name: &str) -> String {
     format!("{stem}.png")
 }
 
+fn thumbnail_from_bytes(bytes: &[u8]) -> Option<String> {
+    let (_, png) = lvgl::decode_i8_thumbnail_png(bytes, FILE_THUMBNAIL_SIZE).ok()?;
+    Some(thumbnail_uri_from_png(png))
+}
+
+fn thumbnail_uri_from_png(png: Vec<u8>) -> String {
+    format!("data:image/png;base64,{}", STANDARD.encode(png))
+}
+
 fn preview_from_bytes(bytes: &[u8]) -> (Option<String>, Option<String>) {
     match lvgl::decode_i8_png(bytes) {
         Ok((_, png)) => (
@@ -1288,10 +1351,10 @@ fn lock_state() -> std::sync::MutexGuard<'static, UiState> {
 
 fn render_current() {
     let (root_id, tree) = {
-        let state = lock_state();
+        let mut state = lock_state();
         (
             state.root_element_id.clone(),
-            build_main_ui(snapshot(&state)),
+            build_main_ui(snapshot(&mut state)),
         )
     };
     if let Some(root_id) = root_id {
@@ -1303,7 +1366,7 @@ pub fn render_main_ui(element_id: &str) {
     let tree = {
         let mut state = lock_state();
         state.root_element_id = Some(element_id.to_string());
-        build_main_ui(snapshot(&state))
+        build_main_ui(snapshot(&mut state))
     };
     psys_host::ui::render(element_id, tree);
 }
@@ -1580,6 +1643,7 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
                     .unwrap_or(entry.size);
                 build_file_row(
                     entry,
+                    state.thumbnail_uris.get(&entry.path).map(String::as_str),
                     is_selected,
                     current_size,
                     show_full_path,
@@ -1787,20 +1851,42 @@ fn build_directory_row(entry: &BrowserEntry, busy: bool) -> ui::Element {
 
 fn build_file_row(
     entry: &BrowserEntry,
+    thumbnail_uri: Option<&str>,
     selected: bool,
     current_size: usize,
     show_full_path: bool,
     busy: bool,
 ) -> ui::Element {
-    let icon = if entry.image.is_some() {
-        "🖼️"
+    let leading = if entry.image.is_some() {
+        let thumbnail = if let Some(uri) = thumbnail_uri {
+            ui::Element::new(ui::ElementType::Image, Some(uri))
+                .max_width(FILE_THUMBNAIL_SIZE)
+                .max_height(FILE_THUMBNAIL_SIZE)
+                .prop("alt", &entry.name)
+                .prop("draggable", "false")
+        } else {
+            ui::Element::new(ui::ElementType::Div, None)
+                .width(FILE_THUMBNAIL_SIZE)
+                .height(FILE_THUMBNAIL_SIZE)
+                .radius(4)
+                .border(1, "gray")
+        };
+        ui::Element::new(ui::ElementType::Div, None)
+            .width(32)
+            .height(32)
+            .flex()
+            .flex_shrink(0.0)
+            .justify_center()
+            .align_center()
+            .child(thumbnail)
     } else {
         let ext = file_extension(&entry.name).unwrap_or_default();
-        if ext == "bin" || ext == "dat" {
+        let icon = if ext == "bin" || ext == "dat" {
             "📦"
         } else {
             "📄"
-        }
+        };
+        span(icon, 13)
     };
 
     let display_name = if show_full_path {
@@ -1815,7 +1901,7 @@ fn build_file_row(
         .align_center()
         .gap(8)
         .flex_grow(1.0)
-        .child(span(icon, 13))
+        .child(leading)
         .child(span(display_name, 13));
 
     let mut right = ui::Element::new(ui::ElementType::Div, None)

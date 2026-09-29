@@ -175,6 +175,20 @@ impl FirmwareIndex {
         Ok(Some(bytes))
     }
 
+    pub fn file_thumbnail_pngs(
+        &self,
+        paths: &[String],
+        max_dimension: u32,
+    ) -> Result<HashMap<String, Vec<u8>>, String> {
+        let mut files = paths
+            .iter()
+            .filter_map(|path| self.file(path))
+            .filter(|file| file.image.is_some())
+            .collect::<Vec<_>>();
+        files.sort_unstable_by_key(|file| file.offset);
+        self.source.thumbnail_ranges(&files, max_dimension)
+    }
+
     pub fn entries_in_dir(&self, directory: &str) -> Vec<BrowserEntry> {
         let prefix = if directory.is_empty() {
             String::new()
@@ -298,6 +312,59 @@ impl FirmwareIndex {
 }
 
 impl FirmwareSource {
+    fn thumbnail_ranges(
+        &self,
+        files: &[&ResourceFile],
+        max_dimension: u32,
+    ) -> Result<HashMap<String, Vec<u8>>, String> {
+        let mut thumbnails = HashMap::with_capacity(files.len());
+        if files.is_empty() {
+            return Ok(thumbnails);
+        }
+
+        match self {
+            Self::RawRomfs(resource) => {
+                for file in files {
+                    let end = file
+                        .offset
+                        .checked_add(file.size)
+                        .ok_or_else(|| "selected resource range overflow".to_string())?;
+                    let source = resource
+                        .get(file.offset..end)
+                        .ok_or_else(|| "selected resource range is outside ROMFS".to_string())?;
+                    let (_, png) = lvgl::decode_i8_thumbnail_reader(
+                        Cursor::new(source),
+                        file.size,
+                        max_dimension,
+                    )?;
+                    thumbnails.insert(file.path.clone(), png);
+                }
+            }
+            Self::Archive {
+                bytes: archive_bytes,
+                resource_index,
+            } => {
+                let mut archive = ZipArchive::new(Cursor::new(archive_bytes.as_slice()))
+                    .map_err(|error| format!("could not reopen firmware archive: {error}"))?;
+                let mut entry = archive
+                    .by_index(*resource_index)
+                    .map_err(|error| format!("could not reopen vela_resource.bin: {error}"))?;
+                let mut reader = ForwardReader::new(&mut entry);
+                for file in files {
+                    reader.advance_to(file.offset as u64)?;
+                    let (_, png) = lvgl::decode_i8_thumbnail_reader(
+                        &mut reader,
+                        file.size,
+                        max_dimension,
+                    )?;
+                    thumbnails.insert(file.path.clone(), png);
+                }
+            }
+        }
+
+        Ok(thumbnails)
+    }
+
     fn read_range(&self, offset: usize, size: usize) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(size).map_err(|error| {
@@ -416,6 +483,14 @@ impl<R: Read> ForwardReader<R> {
             return Err("vela_resource.bin length does not match its ZIP directory".into());
         }
         Ok(())
+    }
+}
+
+impl<R: Read> Read for ForwardReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.position = self.position.saturating_add(count as u64);
+        Ok(count)
     }
 }
 
@@ -619,7 +694,11 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     fn synthetic_romfs() -> Vec<u8> {
-        let mut data = vec![0u8; 132];
+        synthetic_romfs_with_file(b"test")
+    }
+
+    fn synthetic_romfs_with_file(contents: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; 128 + contents.len()];
         data[..8].copy_from_slice(ROMFS_MAGIC);
         let image_size = data.len() as u32;
         data[8..12].copy_from_slice(&image_size.to_be_bytes());
@@ -634,9 +713,21 @@ mod tests {
         data[80..85].copy_from_slice(b"icons");
 
         data[96..100].copy_from_slice(&2u32.to_be_bytes());
-        data[104..108].copy_from_slice(&4u32.to_be_bytes());
+        data[104..108].copy_from_slice(&(contents.len() as u32).to_be_bytes());
         data[112..120].copy_from_slice(b"test.bin");
-        data[128..132].copy_from_slice(b"test");
+        data[128..].copy_from_slice(contents);
+        data
+    }
+
+    fn synthetic_i8_image() -> Vec<u8> {
+        let mut data = vec![0u8; 12 + 256 * 4 + 4];
+        data[0] = 0x19;
+        data[1] = 0x0a;
+        data[4..6].copy_from_slice(&2u16.to_le_bytes());
+        data[6..8].copy_from_slice(&2u16.to_le_bytes());
+        data[8..10].copy_from_slice(&2u16.to_le_bytes());
+        data[12..16].copy_from_slice(&[0, 0, 255, 255]);
+        data[12 + 256 * 4..].fill(0);
         data
     }
 
@@ -665,6 +756,24 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == "test.bin")
         );
+    }
+
+    #[test]
+    fn creates_small_thumbnails_from_raw_and_archived_romfs_without_full_file_buffers() {
+        let image = synthetic_i8_image();
+        let raw = FirmwareIndex::from_romfs(synthetic_romfs_with_file(&image)).unwrap();
+        let paths = vec!["app/icons/test.bin".to_string()];
+        let raw_thumbnails = raw.file_thumbnail_pngs(&paths, 28).unwrap();
+        let raw_thumbnail = raw_thumbnails.get(&paths[0]).unwrap();
+        assert!(raw_thumbnail.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(raw_thumbnail.len() < 1024);
+
+        let archive = zip_with_file("vela_resource.bin", &synthetic_romfs_with_file(&image));
+        let index = FirmwareIndex::from_firmware(archive).unwrap();
+        let archive_thumbnails = index.file_thumbnail_pngs(&paths, 28).unwrap();
+        let archive_thumbnail = archive_thumbnails.get(&paths[0]).unwrap();
+        assert!(archive_thumbnail.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(archive_thumbnail.len() < 1024);
     }
 
     #[test]

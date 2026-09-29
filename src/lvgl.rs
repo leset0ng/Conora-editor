@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
 
@@ -7,6 +7,7 @@ const HEADER_BYTES: usize = 12;
 const PALETTE_BYTES: usize = 256 * 4;
 const PIXEL_OFFSET: usize = HEADER_BYTES + PALETTE_BYTES;
 const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_THUMBNAIL_DIMENSION: u32 = 64;
 const MAX_PNG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UNIQUE_COLORS: usize = 1_000_000;
 
@@ -131,6 +132,82 @@ pub fn decode_i8_png(data: &[u8]) -> Result<(I8Info, Vec<u8>), String> {
         .write_to(&mut cursor, ImageFormat::Png)
         .map_err(|error| format!("PNG encoding failed: {error}"))?;
     Ok((parsed.info, cursor.into_inner()))
+}
+
+pub fn decode_i8_thumbnail_png(
+    data: &[u8],
+    max_dimension: u32,
+) -> Result<(I8Info, Vec<u8>), String> {
+    decode_i8_thumbnail_reader(Cursor::new(data), data.len(), max_dimension)
+}
+
+pub fn decode_i8_thumbnail_reader<R: Read>(
+    mut reader: R,
+    image_size: usize,
+    max_dimension: u32,
+) -> Result<(I8Info, Vec<u8>), String> {
+    if max_dimension == 0 {
+        return Err("thumbnail dimension must be non-zero".into());
+    }
+
+    let mut header = [0u8; HEADER_BYTES];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| "truncated LVGL I8 header".to_string())?;
+    let info = parse_i8_header(&header, image_size)?;
+    let mut palette = [0u8; PALETTE_BYTES];
+    reader
+        .read_exact(&mut palette)
+        .map_err(|_| "truncated LVGL I8 palette".to_string())?;
+
+    let source_width = u32::from(info.width);
+    let source_height = u32::from(info.height);
+    let longest_side = source_width.max(source_height);
+    let scale_numerator = max_dimension.min(MAX_THUMBNAIL_DIMENSION).min(longest_side);
+    let width = (source_width * scale_numerator / longest_side).max(1);
+    let height = (source_height * scale_numerator / longest_side).max(1);
+    let mut thumbnail = RgbaImage::new(width, height);
+    let mut row = vec![0u8; usize::from(info.stride)];
+    let mut destination_y = 0;
+
+    for source_y in 0..source_height as usize {
+        reader
+            .read_exact(&mut row)
+            .map_err(|_| "truncated LVGL I8 image".to_string())?;
+        while destination_y < height {
+            let sampled_y = ((u64::from(destination_y) * u64::from(source_height)
+                + u64::from(height) / 2)
+                / u64::from(height))
+            .min(u64::from(source_height - 1)) as usize;
+            if sampled_y != source_y {
+                break;
+            }
+
+            for x in 0..width {
+                let source_x = ((u64::from(x) * u64::from(source_width) + u64::from(width) / 2)
+                    / u64::from(width))
+                .min(u64::from(source_width - 1)) as usize;
+                let palette_offset = usize::from(row[source_x]) * 4;
+                thumbnail.put_pixel(
+                    x,
+                    destination_y,
+                    image::Rgba([
+                        palette[palette_offset + 2],
+                        palette[palette_offset + 1],
+                        palette[palette_offset],
+                        palette[palette_offset + 3],
+                    ]),
+                );
+            }
+            destination_y += 1;
+        }
+    }
+
+    let mut cursor = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(thumbnail)
+        .write_to(&mut cursor, ImageFormat::Png)
+        .map_err(|error| format!("PNG encoding failed: {error}"))?;
+    Ok((info, cursor.into_inner()))
 }
 
 pub fn encode_png_i8(
@@ -404,6 +481,54 @@ mod tests {
             }
         );
         assert!(inspect_i8_header(&template[..HEADER_BYTES], template.len() - 1).is_none());
+    }
+
+    #[test]
+    fn thumbnail_is_bounded_and_does_not_enlarge_small_images() {
+        let template = sample_template();
+        let (_, thumbnail_png) = decode_i8_thumbnail_png(&template, 1).unwrap();
+        let thumbnail = ImageReader::with_format(Cursor::new(thumbnail_png), ImageFormat::Png)
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(thumbnail.dimensions(), (1, 1));
+        assert_eq!(thumbnail.get_pixel(0, 0).0, [0, 0, 0, 255]);
+
+        let (_, thumbnail_png) = decode_i8_thumbnail_png(&template, 32).unwrap();
+        let thumbnail = ImageReader::with_format(Cursor::new(thumbnail_png), ImageFormat::Png)
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(thumbnail.dimensions(), (2, 2));
+        assert!(decode_i8_thumbnail_png(&template, 0).is_err());
+    }
+
+    #[test]
+    fn thumbnail_downscales_large_images_with_a_hard_dimension_cap() {
+        let width = 128u16;
+        let height = 64u16;
+        let mut image = vec![0u8; PIXEL_OFFSET + usize::from(width) * usize::from(height)];
+        image[0] = 0x19;
+        image[1] = 0x0a;
+        image[4..6].copy_from_slice(&width.to_le_bytes());
+        image[6..8].copy_from_slice(&height.to_le_bytes());
+        image[8..10].copy_from_slice(&width.to_le_bytes());
+        image[12..16].copy_from_slice(&[0, 0, 255, 255]);
+
+        let (_, thumbnail_png) = decode_i8_thumbnail_png(&image, 28).unwrap();
+        let thumbnail = ImageReader::with_format(Cursor::new(thumbnail_png), ImageFormat::Png)
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(thumbnail.dimensions(), (28, 14));
+        assert_eq!(thumbnail.get_pixel(0, 0).0, [255, 0, 0, 255]);
+
+        let (_, thumbnail_png) = decode_i8_thumbnail_png(&image, u32::MAX).unwrap();
+        let thumbnail = ImageReader::with_format(Cursor::new(thumbnail_png), ImageFormat::Png)
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(thumbnail.dimensions(), (64, 32));
     }
 
     #[test]
