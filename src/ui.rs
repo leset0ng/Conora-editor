@@ -217,6 +217,8 @@ async fn process_click(event_id: &str) {
     match event_id {
         "firmware.upload" => begin_firmware_pick().await,
         "pack.export" => begin_export().await,
+        "resource.extract" => begin_resource_extract(false).await,
+        "resource.extract.png" => begin_resource_extract(true).await,
         "browser.apply-search" => apply_search(),
         "browser.parent" => {
             {
@@ -808,6 +810,160 @@ async fn begin_export() {
     render_current();
 }
 
+async fn begin_resource_extract(as_png: bool) {
+    let path = {
+        let mut state = lock_state();
+        if state.busy {
+            return;
+        }
+        let Some(path) = state.selected_path.clone() else {
+            state.error = Some("请先从文件树选择要提取的资源。".into());
+            drop(state);
+            render_current();
+            return;
+        };
+        state.busy = true;
+        state.error = None;
+        state.status = if as_png {
+            "正在将当前资源转换为 PNG…".into()
+        } else {
+            "正在准备提取当前资源…".into()
+        };
+        path
+    };
+    render_current();
+
+    let bytes = {
+        let state = lock_state();
+        resource_bytes(&state, &path)
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let mut state = lock_state();
+            state.busy = false;
+            state.status = "资源提取未完成。".into();
+            state.error = Some(format!("无法读取资源：{error}"));
+            drop(state);
+            render_current();
+            return;
+        }
+    };
+    if as_png && lvgl::inspect_i8(bytes.as_slice()).is_none() {
+        let mut state = lock_state();
+        state.busy = false;
+        state.status = "资源提取未完成。".into();
+        state.error = Some("此资源不是受支持的 LVGL v9 I8 图片，无法转换为 PNG。".into());
+        drop(state);
+        render_current();
+        return;
+    }
+
+    let resource_name = resource_file_name(&path);
+    let file_name = if as_png {
+        png_file_name(&resource_name)
+    } else {
+        resource_name
+    };
+    let extension = if as_png {
+        Some("png".to_string())
+    } else {
+        file_extension(&file_name)
+    };
+    let result = if as_png {
+        match lvgl::decode_i8_png(bytes.as_slice()) {
+            Ok((_, png)) => save_resource_file(&png, &file_name, extension.as_deref())
+                .await
+                .map(|()| png.len()),
+            Err(error) => Err(format!("BIN 转 PNG 失败：{error}")),
+        }
+    } else {
+        save_resource_file(bytes.as_slice(), &file_name, extension.as_deref())
+            .await
+            .map(|()| bytes.len())
+    };
+
+    let mut state = lock_state();
+    state.busy = false;
+    match result {
+        Ok(size) => {
+            state.status = format!("已提取当前资源「{}」· {}。", file_name, format_bytes(size));
+            state.error = None;
+        }
+        Err(error) => {
+            state.status = "资源提取未完成。".into();
+            state.error = Some(error);
+        }
+    }
+    drop(state);
+    render_current();
+}
+
+fn resource_bytes(state: &UiState, path: &str) -> Result<Arc<Vec<u8>>, String> {
+    if let Some(bytes) = state.replacements.get(path) {
+        return Ok(Arc::new(bytes.clone()));
+    }
+    state
+        .firmware
+        .as_ref()
+        .ok_or_else(|| "尚未加载固件。".to_string())?
+        .file_bytes(path)?
+        .ok_or_else(|| "所选资源已不存在。".to_string())
+}
+
+async fn save_resource_file(
+    bytes: &[u8],
+    file_name: &str,
+    extension: Option<&str>,
+) -> Result<(), String> {
+    let session = psys_host::dialog::save_file_start(psys_host::dialog::FilterConfig {
+        multiple: false,
+        extensions: extension.map_or_else(Vec::new, |value| vec![value.to_string()]),
+        default_directory: String::new(),
+        default_file_name: file_name.to_string(),
+    })
+    .await
+    .map_err(|error| format!("无法打开保存对话框：{error}"))?;
+
+    for chunk in bytes.chunks(SAVE_CHUNK_BYTES) {
+        if let Err(error) =
+            psys_host::dialog::save_file_write_chunk(session.session_id, chunk.to_vec()).await
+        {
+            psys_host::dialog::save_file_abort(session.session_id).await;
+            return Err(format!("未能完整写入提取文件：{error}"));
+        }
+    }
+
+    if let Err(error) = psys_host::dialog::save_file_finish(session.session_id).await {
+        psys_host::dialog::save_file_abort(session.session_id).await;
+        return Err(format!("未能完成提取文件：{error}"));
+    }
+    Ok(())
+}
+
+fn resource_file_name(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("resource.bin")
+        .to_string()
+}
+
+fn file_extension(file_name: &str) -> Option<String> {
+    file_name
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+}
+
+fn png_file_name(file_name: &str) -> String {
+    let stem = file_name
+        .rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map_or(file_name, |(stem, _)| stem);
+    format!("{stem}.png")
+}
+
 fn preview_from_bytes(bytes: &[u8]) -> (Option<String>, Option<String>) {
     match lvgl::decode_i8_png(bytes) {
         Ok((_, png)) => (
@@ -1193,9 +1349,25 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
         }
         content = content.child(selection);
 
+        let extract_buttons = ui::Element::new(ui::ElementType::Div, None)
+            .flex()
+            .flex_direction(ui::FlexDirection::Row)
+            .gap(8)
+            .child(
+                button("提取当前文件", "resource.extract", "soft", "gray").disabled_if(state.busy),
+            )
+            .child(
+                button("转换并提取 PNG", "resource.extract.png", "soft", "accent")
+                    .disabled_if(state.busy || image_info.is_none()),
+            );
+        content = content
+            .child(extract_buttons)
+            .child(text("若资源已替换，将提取替换后的版本。", 12));
+
         let image_buttons = ui::Element::new(ui::ElementType::Div, None)
             .flex()
             .flex_direction(ui::FlexDirection::Row)
+            .gap(8)
             .child(
                 button("用 PNG 替换", "replace.png", "soft", "accent")
                     .disabled_if(state.busy || !state.selected_template_image),
@@ -1342,5 +1514,23 @@ trait DisabledElement {
 impl DisabledElement for ui::Element {
     fn disabled_if(self, disabled: bool) -> Self {
         if disabled { self.disabled() } else { self }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracted_names_use_the_resource_leaf_and_png_extension() {
+        assert_eq!(resource_file_name("app/icons/confirm.bin"), "confirm.bin");
+        assert_eq!(png_file_name("confirm.bin"), "confirm.png");
+        assert_eq!(png_file_name("icon"), "icon.png");
+    }
+
+    #[test]
+    fn file_extension_ignores_dotfiles_and_normalizes_case() {
+        assert_eq!(file_extension("confirm.BIN"), Some("bin".into()));
+        assert_eq!(file_extension(".hidden"), None);
     }
 }
