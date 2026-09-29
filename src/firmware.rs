@@ -28,6 +28,8 @@ pub struct BrowserEntry {
     pub is_directory: bool,
     pub size: usize,
     pub image: Option<I8Info>,
+    pub child_count: usize,
+    pub has_replacements: bool,
 }
 
 enum FirmwareSource {
@@ -199,6 +201,8 @@ impl FirmwareIndex {
                             is_directory: true,
                             size: 0,
                             image: None,
+                            child_count: 0,
+                            has_replacements: false,
                         });
                 }
             } else if !rest.is_empty() {
@@ -210,6 +214,8 @@ impl FirmwareIndex {
                         is_directory: true,
                         size: 0,
                         image: None,
+                        child_count: 0,
+                        has_replacements: false,
                     });
             }
         }
@@ -232,6 +238,8 @@ impl FirmwareIndex {
                             is_directory: true,
                             size: 0,
                             image: None,
+                            child_count: 0,
+                            has_replacements: false,
                         });
                 }
             } else if !rest.is_empty() {
@@ -243,6 +251,8 @@ impl FirmwareIndex {
                         is_directory: false,
                         size: file.size,
                         image: file.image,
+                        child_count: 0,
+                        has_replacements: false,
                     },
                 );
             }
@@ -260,6 +270,30 @@ impl FirmwareIndex {
 
     pub fn directory_exists(&self, path: &str) -> bool {
         path.is_empty() || self.directories.contains(path.trim_end_matches('/'))
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.files.iter().filter(|f| f.image.is_some()).count()
+    }
+
+    pub fn file_count_in_dir(&self, dir: &str) -> usize {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir.trim_end_matches('/'))
+        };
+        self.files.iter().filter(|f| f.path.starts_with(&prefix)).count()
+    }
+
+    pub fn dir_has_images(&self, dir: &str) -> bool {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir.trim_end_matches('/'))
+        };
+        self.files
+            .iter()
+            .any(|f| f.image.is_some() && f.path.starts_with(&prefix))
     }
 }
 

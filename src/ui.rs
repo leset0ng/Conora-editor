@@ -14,12 +14,20 @@ const MAX_VISIBLE_ENTRIES: usize = 300;
 const MAX_SEARCH_RESULTS: usize = 200;
 const SAVE_CHUNK_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResourceFilter {
+    All,
+    Images,
+    Replaced,
+}
+
 struct UiState {
     root_element_id: Option<String>,
     firmware_name: String,
     firmware: Option<FirmwareIndex>,
     current_dir: String,
     search_query: String,
+    filter_mode: ResourceFilter,
     selected_path: Option<String>,
     preview_uri: Option<String>,
     replacements: BTreeMap<String, Vec<u8>>,
@@ -45,6 +53,7 @@ fn ui_state() -> &'static Mutex<UiState> {
             firmware: None,
             current_dir: String::new(),
             search_query: String::new(),
+            filter_mode: ResourceFilter::All,
             selected_path: None,
             preview_uri: None,
             replacements: BTreeMap::new(),
@@ -66,8 +75,10 @@ fn ui_state() -> &'static Mutex<UiState> {
 struct UiSnapshot {
     firmware_name: String,
     file_count: usize,
+    image_count: usize,
     current_dir: String,
     search_query: String,
+    filter_mode: ResourceFilter,
     entries: Vec<BrowserEntry>,
     hidden_entries: usize,
     selected_path: Option<String>,
@@ -91,50 +102,114 @@ struct UiSnapshot {
 }
 
 fn snapshot(state: &UiState) -> UiSnapshot {
-    let (file_count, entries, hidden_entries) = if let Some(firmware) = &state.firmware {
-        if state.search_query.trim().is_empty() {
-            let all = firmware.entries_in_dir(&state.current_dir);
-            let hidden = all.len().saturating_sub(MAX_VISIBLE_ENTRIES);
-            (
-                firmware.file_count(),
-                all.into_iter().take(MAX_VISIBLE_ENTRIES).collect(),
-                hidden,
-            )
-        } else {
-            let query = state.search_query.trim().to_lowercase();
-            let all = firmware
-                .files()
-                .iter()
-                .filter(|file| {
-                    file.path.to_lowercase().contains(&query)
-                        || file
-                            .path
+    let (file_count, image_count, entries, hidden_entries) = if let Some(firmware) = &state.firmware {
+        let total_files = firmware.file_count();
+        let total_images = firmware.image_count();
+        let is_images_only = state.filter_mode == ResourceFilter::Images;
+
+        let (entries, hidden_entries) = match state.filter_mode {
+            ResourceFilter::Replaced => {
+                let query = state.search_query.trim().to_lowercase();
+                let mut list = Vec::new();
+                for (path, bytes) in &state.replacements {
+                    if !query.is_empty()
+                        && !path.to_lowercase().contains(&query)
+                        && !path
                             .rsplit('/')
                             .next()
                             .is_some_and(|name| name.to_lowercase().contains(&query))
-                })
-                .map(|file| BrowserEntry {
-                    name: file
-                        .path
+                    {
+                        continue;
+                    }
+                    let original = firmware.file(path);
+                    let image = lvgl::inspect_i8(bytes.as_slice())
+                        .or_else(|| original.and_then(|file| file.image));
+                    let name = path
                         .rsplit('/')
                         .next()
-                        .unwrap_or(&file.path)
-                        .to_string(),
-                    path: file.path.clone(),
-                    is_directory: false,
-                    size: file.size,
-                    image: file.image,
-                })
-                .collect::<Vec<_>>();
-            let hidden = all.len().saturating_sub(MAX_SEARCH_RESULTS);
-            (
-                firmware.file_count(),
-                all.into_iter().take(MAX_SEARCH_RESULTS).collect(),
-                hidden,
-            )
-        }
+                        .unwrap_or(path.as_str())
+                        .to_string();
+                    list.push(BrowserEntry {
+                        name,
+                        path: path.clone(),
+                        is_directory: false,
+                        size: bytes.len(),
+                        image,
+                        child_count: 0,
+                        has_replacements: true,
+                    });
+                }
+                list.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+                let hidden = list.len().saturating_sub(MAX_SEARCH_RESULTS);
+                (list.into_iter().take(MAX_SEARCH_RESULTS).collect(), hidden)
+            }
+            ResourceFilter::All | ResourceFilter::Images => {
+                if state.search_query.trim().is_empty() {
+                    let mut all = firmware.entries_in_dir(&state.current_dir);
+                    all.retain_mut(|entry| {
+                        if entry.is_directory {
+                            entry.child_count = firmware.file_count_in_dir(&entry.path);
+                            let prefix = format!("{}/", entry.path);
+                            entry.has_replacements = state
+                                .replacements
+                                .keys()
+                                .any(|k| k.starts_with(&prefix));
+                            if is_images_only {
+                                firmware.dir_has_images(&entry.path)
+                            } else {
+                                true
+                            }
+                        } else {
+                            entry.has_replacements = state.replacements.contains_key(&entry.path);
+                            if is_images_only {
+                                entry.image.is_some()
+                            } else {
+                                true
+                            }
+                        }
+                    });
+                    let hidden = all.len().saturating_sub(MAX_VISIBLE_ENTRIES);
+                    (all.into_iter().take(MAX_VISIBLE_ENTRIES).collect(), hidden)
+                } else {
+                    let query = state.search_query.trim().to_lowercase();
+                    let all = firmware
+                        .files()
+                        .iter()
+                        .filter(|file| {
+                            if is_images_only && file.image.is_none() {
+                                return false;
+                            }
+                            file.path.to_lowercase().contains(&query)
+                                || file
+                                    .path
+                                    .rsplit('/')
+                                    .next()
+                                    .is_some_and(|name| name.to_lowercase().contains(&query))
+                        })
+                        .map(|file| BrowserEntry {
+                            name: file
+                                .path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&file.path)
+                                .to_string(),
+                            path: file.path.clone(),
+                            is_directory: false,
+                            size: file.size,
+                            image: file.image,
+                            child_count: 0,
+                            has_replacements: state.replacements.contains_key(&file.path),
+                        })
+                        .collect::<Vec<_>>();
+                    let hidden = all.len().saturating_sub(MAX_SEARCH_RESULTS);
+                    (all.into_iter().take(MAX_SEARCH_RESULTS).collect(), hidden)
+                }
+            }
+        };
+
+        (total_files, total_images, entries, hidden_entries)
     } else {
-        (0, Vec::new(), 0)
+        (0, 0, Vec::new(), 0)
     };
 
     let selected = state
@@ -167,8 +242,10 @@ fn snapshot(state: &UiState) -> UiSnapshot {
     UiSnapshot {
         firmware_name: state.firmware_name.clone(),
         file_count,
+        image_count,
         current_dir: state.current_dir.clone(),
         search_query: state.search_query.clone(),
+        filter_mode: state.filter_mode,
         entries,
         hidden_entries,
         selected_path: state.selected_path.clone(),
@@ -220,16 +297,59 @@ async fn process_click(event_id: &str) {
         "resource.extract" => begin_resource_extract(false).await,
         "resource.extract.png" => begin_resource_extract(true).await,
         "browser.apply-search" => apply_search(),
+        "browser.clear-search" => {
+            {
+                let mut state = lock_state();
+                state.search_query.clear();
+                state.status = "已清空搜索筛选。".into();
+                state.error = None;
+            }
+            render_current();
+        }
+        "browser.filter:all" => {
+            {
+                let mut state = lock_state();
+                state.filter_mode = ResourceFilter::All;
+                state.status = "显示全部资源。".into();
+                state.error = None;
+            }
+            render_current();
+        }
+        "browser.filter:images" => {
+            {
+                let mut state = lock_state();
+                state.filter_mode = ResourceFilter::Images;
+                state.status = "仅显示 LVGL 图片资源。".into();
+                state.error = None;
+            }
+            render_current();
+        }
+        "browser.filter:replaced" => {
+            {
+                let mut state = lock_state();
+                state.filter_mode = ResourceFilter::Replaced;
+                state.status = "显示已替换的资源清单。".into();
+                state.error = None;
+            }
+            render_current();
+        }
         "browser.parent" => {
             {
                 let mut state = lock_state();
                 state.search_query.clear();
+                if state.filter_mode == ResourceFilter::Replaced {
+                    state.filter_mode = ResourceFilter::All;
+                }
                 if let Some((parent, _)) = state.current_dir.rsplit_once('/') {
                     state.current_dir = parent.to_string();
                 } else {
                     state.current_dir.clear();
                 }
-                state.status = "已返回上级目录。".into();
+                state.status = if state.current_dir.is_empty() {
+                    "已返回资源根目录。".into()
+                } else {
+                    format!("正在浏览 /resource/{}/", state.current_dir)
+                };
                 state.error = None;
             }
             render_current();
@@ -241,16 +361,24 @@ async fn process_click(event_id: &str) {
             let path = &event_id["browser.open:".len()..];
             {
                 let mut state = lock_state();
-                if state
-                    .firmware
-                    .as_ref()
-                    .is_some_and(|firmware| firmware.directory_exists(path))
+                if path.is_empty()
+                    || state
+                        .firmware
+                        .as_ref()
+                        .is_some_and(|firmware| firmware.directory_exists(path))
                 {
                     state.current_dir = path.to_string();
                     state.search_query.clear();
+                    if state.filter_mode == ResourceFilter::Replaced {
+                        state.filter_mode = ResourceFilter::All;
+                    }
                     state.selected_path = None;
                     state.preview_uri = None;
-                    state.status = format!("正在浏览 /resource/{path}/");
+                    state.status = if path.is_empty() {
+                        "已返回资源根目录。".into()
+                    } else {
+                        format!("正在浏览 /resource/{path}/")
+                    };
                     state.error = None;
                 }
             }
@@ -394,6 +522,7 @@ async fn begin_firmware_pick() {
                 state.firmware = Some(firmware);
                 state.current_dir.clear();
                 state.search_query.clear();
+                state.filter_mode = ResourceFilter::All;
                 state.selected_path = None;
                 state.preview_uri = None;
                 state.replacements.clear();
@@ -1059,61 +1188,12 @@ pub fn render_main_ui(element_id: &str) {
 }
 
 fn build_main_ui(state: UiSnapshot) -> ui::Element {
-    let header = ui::Element::new(ui::ElementType::Div, None)
-        .flex()
-        .flex_direction(ui::FlexDirection::Row)
-        .flex_grow(1.0)
-        .align_center()
-        .justify_start()
-        .gap(12)
-        .child(text("Conora CRPack Builder", 24))
-        .child(badge("固件资源工具", "gray"));
-
-    let upload = button(
-        if state.busy {
-            "处理中…"
-        } else {
-            "选择固件"
-        },
-        "firmware.upload",
-        if state.busy { "soft" } else { "solid" },
-        "accent",
-    )
-    .disabled_if(state.busy);
-    let export = button(
-        if state.busy {
-            "处理中…"
-        } else {
-            "导出 .crpack"
-        },
-        "pack.export",
-        "solid",
-        "accent",
-    )
-    .disabled_if(state.busy || state.replacement_count == 0);
-    let actions = ui::Element::new(ui::ElementType::Div, None)
-        .flex()
-        .flex_direction(ui::FlexDirection::Row)
-        .align_center()
-        .gap(8)
-        .child(upload)
-        .child(export);
-    let header_row = ui::Element::new(ui::ElementType::Div, None)
-        .flex()
-        .flex_direction(ui::FlexDirection::Row)
-        .width_full()
-        .align_center()
-        .gap(12)
-        .child(header)
-        .child(actions);
-
     let mut root = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Column)
         .width_full()
         .padding(12)
-        .gap(12)
-        .child(header_row);
+        .gap(12);
 
     if state.firmware_name.is_empty() {
         let empty = ui::Element::new(ui::ElementType::Card, None)
@@ -1133,18 +1213,66 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
             .child(button("选择手环固件", "firmware.upload", "solid", "accent"));
         root = root.child(empty);
     } else {
+        let upload = button(
+            if state.busy {
+                "处理中…"
+            } else {
+                "更换固件"
+            },
+            "firmware.upload",
+            "soft",
+            "gray",
+        )
+        .disabled_if(state.busy);
+
+        let export = button(
+            if state.busy {
+                "处理中…"
+            } else {
+                "导出 .crpack"
+            },
+            "pack.export",
+            "solid",
+            "accent",
+        )
+        .disabled_if(state.busy || state.replacement_count == 0);
+
+        let actions = ui::Element::new(ui::ElementType::Div, None)
+            .flex()
+            .flex_direction(ui::FlexDirection::Row)
+            .align_center()
+            .gap(8)
+            .flex_shrink(0.0)
+            .child(upload)
+            .child(export);
+
         let summary = ui::Element::new(ui::ElementType::Div, None)
+            .flex()
+            .flex_direction(ui::FlexDirection::Row)
+            .flex_grow(1.0)
+            .align_center()
+            .gap(8)
+            .child(span("📦", 14))
+            .child(span(&state.firmware_name, 14))
+            .child(badge(&format!("{} 个文件", state.file_count), "gray"))
+            .child(badge(
+                &format!("已替换 {}", state.replacement_count),
+                if state.replacement_count > 0 {
+                    "accent"
+                } else {
+                    "gray"
+                },
+            ));
+
+        let toolbar = ui::Element::new(ui::ElementType::Div, None)
             .flex()
             .flex_direction(ui::FlexDirection::Row)
             .width_full()
             .align_center()
-            .child(text(&state.firmware_name, 14))
-            .child(badge(&format!("{} 个文件", state.file_count), "gray"))
-            .child(badge(
-                &format!("已替换 {}", state.replacement_count),
-                "accent",
-            ));
-        root = root.child(summary);
+            .child(summary)
+            .child(actions);
+
+        root = root.child(toolbar);
 
         let browser = build_browser(&state);
         let inspector = build_inspector(&state);
@@ -1161,52 +1289,110 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
 }
 
 fn build_browser(state: &UiSnapshot) -> ui::Element {
-    let location = if state.search_query.is_empty() {
-        format!("/resource/{}", state.current_dir)
-    } else {
-        "搜索结果".to_string()
-    };
+    let pills = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(4)
+        .child(
+            button(
+                &format!("全部 {}", state.file_count),
+                "browser.filter:all",
+                if state.filter_mode == ResourceFilter::All {
+                    "solid"
+                } else {
+                    "ghost"
+                },
+                if state.filter_mode == ResourceFilter::All {
+                    "accent"
+                } else {
+                    "gray"
+                },
+            )
+            .prop("size", "1")
+            .disabled_if(state.busy),
+        )
+        .child(
+            button(
+                &format!("图片 {}", state.image_count),
+                "browser.filter:images",
+                if state.filter_mode == ResourceFilter::Images {
+                    "solid"
+                } else {
+                    "ghost"
+                },
+                if state.filter_mode == ResourceFilter::Images {
+                    "accent"
+                } else {
+                    "gray"
+                },
+            )
+            .prop("size", "1")
+            .disabled_if(state.busy),
+        )
+        .child(
+            button(
+                &format!("已替换 {}", state.replacement_count),
+                "browser.filter:replaced",
+                if state.filter_mode == ResourceFilter::Replaced {
+                    "solid"
+                } else if state.replacement_count > 0 {
+                    "soft"
+                } else {
+                    "ghost"
+                },
+                if state.filter_mode == ResourceFilter::Replaced || state.replacement_count > 0 {
+                    "accent"
+                } else {
+                    "gray"
+                },
+            )
+            .prop("size", "1")
+            .disabled_if(state.busy),
+        );
+
     let heading = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Row)
         .width_full()
         .align_center()
-        .child(text("资源文件", 17))
-        .child(badge(&location, "gray"));
+        .child(text("资源浏览", 16).flex_grow(1.0))
+        .child(pills);
+
+    let breadcrumbs = build_breadcrumbs(state);
 
     let search = ui::Element::new(ui::ElementType::Input, Some(state.search_query.as_str()))
-        .prop("placeholder", "搜索路径或文件名")
+        .prop("placeholder", "搜索路径或文件名…")
         .prop("size", "2")
         .prop("variant", "surface")
         .prop("radius", "medium")
         .flex_grow(1.0)
         .on(ui::Event::Change, "browser.search")
         .on(ui::Event::KeyDown, "browser.search.key");
-    let search_row = ui::Element::new(ui::ElementType::Div, None)
+
+    let mut search_row = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Row)
         .width_full()
         .align_center()
-        .gap(8)
+        .gap(6)
         .child(search)
-        .child(button("筛选", "browser.apply-search", "soft", "gray"));
-    let mut browser_content = ui::Element::new(ui::ElementType::Div, None)
-        .flex()
-        .flex_direction(ui::FlexDirection::Column)
-        .width_full()
-        .gap(8)
-        .child(heading)
-        .child(search_row);
+        .child(
+            button("筛选", "browser.apply-search", "soft", "gray")
+                .disabled_if(state.busy),
+        );
 
-    if state.search_query.is_empty() && !state.current_dir.is_empty() {
-        browser_content =
-            browser_content.child(button("返回上级目录", "browser.parent", "soft", "gray"));
+    if !state.search_query.trim().is_empty() {
+        search_row = search_row.child(
+            button("清空", "browser.clear-search", "ghost", "gray")
+                .disabled_if(state.busy),
+        );
     }
 
     let mut list = ui::Element::new(ui::ElementType::ScrollArea, None)
         .prop("type", "auto")
         .prop("scrollbars", "vertical")
-        .height(360)
+        .height(440)
         .width_full()
         .radius(12)
         .padding(4)
@@ -1215,67 +1401,72 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
         .gap(4);
 
     if state.entries.is_empty() {
-        list = list.child(text(
-            if state.search_query.is_empty() {
-                "此目录没有可浏览的文件。"
-            } else {
-                "没有找到匹配的资源。"
-            },
-            14,
-        ));
+        let empty_tip = if state.filter_mode == ResourceFilter::Replaced {
+            "暂无已替换资源。可从文件树选择文件，在右侧替换 PNG 或二进制。"
+        } else if state.filter_mode == ResourceFilter::Images {
+            "当前目录下没有 LVGL 图片资源。"
+        } else if !state.search_query.is_empty() {
+            "没有找到匹配的资源。"
+        } else {
+            "此目录没有可浏览的文件。"
+        };
+        list = list.child(
+            ui::Element::new(ui::ElementType::Div, None)
+                .padding(16)
+                .flex()
+                .justify_center()
+                .align_center()
+                .child(text(empty_tip, 13)),
+        );
     } else {
+        let show_full_path = !state.search_query.is_empty()
+            || state.filter_mode == ResourceFilter::Replaced;
         for entry in &state.entries {
-            let (label, event_id, variant, color) = if entry.is_directory {
-                (
-                    format!("目录  ·  {}", entry.name),
-                    format!("browser.open:{}", entry.path),
-                    "soft",
-                    "gray",
-                )
+            let row = if entry.is_directory {
+                build_directory_row(entry, state.busy)
             } else {
-                let kind = if entry.image.is_some() {
-                    "LVGL I8"
-                } else {
-                    "文件"
-                };
-                let selected = state.selected_path.as_deref() == Some(entry.path.as_str());
-                let replacement_size = state.replacement_sizes.get(&entry.path);
-                let replacement_status = if replacement_size.is_some() {
-                    "已替换"
-                } else {
-                    "原始"
-                };
-                (
-                    format!(
-                        "{kind}  ·  {replacement_status}  ·  {}  ·  {}",
-                        if state.search_query.is_empty() {
-                            entry.name.clone()
-                        } else {
-                            entry.path.clone()
-                        },
-                        format_bytes(replacement_size.copied().unwrap_or(entry.size))
-                    ),
-                    format!("browser.select:{}", entry.path),
-                    if selected { "soft" } else { "ghost" },
-                    if selected { "accent" } else { "gray" },
+                let is_selected = state.selected_path.as_deref() == Some(entry.path.as_str());
+                let current_size = state
+                    .replacement_sizes
+                    .get(&entry.path)
+                    .copied()
+                    .unwrap_or(entry.size);
+                build_file_row(
+                    entry,
+                    is_selected,
+                    current_size,
+                    show_full_path,
+                    state.busy,
                 )
             };
-            list = list.child(
-                button(&label, &event_id, variant, color)
-                    .width_full()
-                    .prop("size", "2")
-                    .disabled_if(state.busy),
-            );
+            list = list.child(row);
         }
     }
+
     if state.hidden_entries > 0 {
-        list = list.child(text(
-            &format!("还有 {} 项未显示；使用搜索框筛选。", state.hidden_entries),
-            12,
-        ));
+        list = list.child(
+            ui::Element::new(ui::ElementType::Div, None)
+                .padding_top(6)
+                .padding_bottom(6)
+                .flex()
+                .justify_center()
+                .child(text(
+                    &format!("还有 {} 项未显示；使用搜索框筛选。", state.hidden_entries),
+                    12,
+                )),
+        );
     }
 
-    browser_content = browser_content.child(list);
+    let browser_content = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .width_full()
+        .gap(8)
+        .child(heading)
+        .child(breadcrumbs)
+        .child(search_row)
+        .child(list);
+
     ui::Element::new(ui::ElementType::Card, None)
         .prop("variant", "surface")
         .prop("size", "2")
@@ -1286,6 +1477,247 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
         .align_start()
         .gap(10)
         .child(browser_content)
+}
+
+fn build_breadcrumbs(state: &UiSnapshot) -> ui::Element {
+    if state.filter_mode == ResourceFilter::Replaced {
+        return ui::Element::new(ui::ElementType::Div, None)
+            .flex()
+            .flex_direction(ui::FlexDirection::Row)
+            .width_full()
+            .align_center()
+            .gap(6)
+            .child(
+                ui::Element::new(ui::ElementType::Div, None)
+                    .flex()
+                    .flex_direction(ui::FlexDirection::Row)
+                    .align_center()
+                    .gap(6)
+                    .flex_grow(1.0)
+                    .child(span("✏️", 13))
+                    .child(span("全部已修改资源清单", 13))
+                    .child(badge(&format!("{} 项", state.replacement_count), "accent")),
+            )
+            .child(
+                button("返回目录浏览", "browser.filter:all", "ghost", "gray")
+                    .prop("size", "1")
+                    .disabled_if(state.busy),
+            );
+    }
+
+    if !state.search_query.trim().is_empty() {
+        return ui::Element::new(ui::ElementType::Div, None)
+            .flex()
+            .flex_direction(ui::FlexDirection::Row)
+            .width_full()
+            .align_center()
+            .gap(6)
+            .child(
+                ui::Element::new(ui::ElementType::Div, None)
+                    .flex()
+                    .flex_direction(ui::FlexDirection::Row)
+                    .align_center()
+                    .gap(6)
+                    .flex_grow(1.0)
+                    .child(span("🔍", 13))
+                    .child(span(&format!("搜索: \"{}\"", state.search_query.trim()), 13))
+                    .child(badge(&format!("{} 项", state.entries.len()), "gray")),
+            )
+            .child(
+                button("清空搜索", "browser.clear-search", "ghost", "gray")
+                    .prop("size", "1")
+                    .disabled_if(state.busy),
+            );
+    }
+
+    let mut trail = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(4)
+        .flex_grow(1.0);
+
+    let is_root = state.current_dir.is_empty();
+    trail = trail.child(
+        button(
+            "🏠 resource",
+            "browser.open:",
+            if is_root { "soft" } else { "ghost" },
+            if is_root { "accent" } else { "gray" },
+        )
+        .prop("size", "1")
+        .disabled_if(state.busy),
+    );
+
+    if !is_root {
+        let mut accumulated = String::new();
+        let segments = state
+            .current_dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let total = segments.len();
+        for (idx, segment) in segments.into_iter().enumerate() {
+            if !accumulated.is_empty() {
+                accumulated.push('/');
+            }
+            accumulated.push_str(segment);
+            let is_last = idx + 1 == total;
+            trail = trail.child(span("/", 11));
+            trail = trail.child(
+                button(
+                    segment,
+                    &format!("browser.open:{accumulated}"),
+                    if is_last { "soft" } else { "ghost" },
+                    if is_last { "accent" } else { "gray" },
+                )
+                .prop("size", "1")
+                .disabled_if(state.busy),
+            );
+        }
+    }
+
+    let mut bar = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .width_full()
+        .align_center()
+        .gap(6)
+        .child(trail);
+
+    if !state.current_dir.is_empty() {
+        bar = bar.child(
+            button("← 上级", "browser.parent", "ghost", "gray")
+                .prop("size", "1")
+                .disabled_if(state.busy),
+        );
+    }
+
+    bar
+}
+
+fn build_directory_row(entry: &BrowserEntry, busy: bool) -> ui::Element {
+    let left = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(8)
+        .flex_grow(1.0)
+        .child(span("📁", 13))
+        .child(span(&format!("{}/", entry.name), 13));
+
+    let mut right = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(6)
+        .flex_shrink(0.0);
+
+    if entry.has_replacements {
+        right = right.child(badge("● 含修改", "accent"));
+    }
+    if entry.child_count > 0 {
+        right = right.child(span(&format!("{} 项", entry.child_count), 12));
+    }
+    right = right.child(span("›", 13));
+
+    let row = ui::Element::new(ui::ElementType::Button, None)
+        .prop("variant", "ghost")
+        .prop("color", "gray")
+        .prop("size", "2")
+        .prop("radius", "medium")
+        .width_full()
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .padding_left(8)
+        .padding_right(8)
+        .on(ui::Event::Click, &format!("browser.open:{}", entry.path))
+        .disabled_if(busy);
+
+    row.child(left).child(right)
+}
+
+fn build_file_row(
+    entry: &BrowserEntry,
+    selected: bool,
+    current_size: usize,
+    show_full_path: bool,
+    busy: bool,
+) -> ui::Element {
+    let icon = if entry.image.is_some() {
+        "🖼️"
+    } else {
+        let ext = file_extension(&entry.name).unwrap_or_default();
+        if ext == "bin" || ext == "dat" {
+            "📦"
+        } else {
+            "📄"
+        }
+    };
+
+    let display_name = if show_full_path {
+        &entry.path
+    } else {
+        &entry.name
+    };
+
+    let left = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(8)
+        .flex_grow(1.0)
+        .child(span(icon, 13))
+        .child(span(display_name, 13));
+
+    let mut right = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .gap(6)
+        .flex_shrink(0.0);
+
+    if let Some(info) = entry.image {
+        right = right.child(badge(&format!("{}×{}", info.width, info.height), "gray"));
+    } else if let Some(ext) = file_extension(&entry.name) {
+        right = right.child(badge(&ext.to_ascii_uppercase(), "gray"));
+    }
+
+    if entry.has_replacements {
+        right = right.child(badge("已替换", "accent"));
+    }
+
+    right = right.child(span(&format_bytes(current_size), 12));
+
+    let mut row = ui::Element::new(ui::ElementType::Button, None)
+        .prop("size", "2")
+        .prop("radius", "medium")
+        .prop(
+            "variant",
+            if selected {
+                "soft"
+            } else if entry.has_replacements {
+                "surface"
+            } else {
+                "ghost"
+            },
+        );
+
+    if !selected && !entry.has_replacements {
+        row = row.prop("color", "gray");
+    }
+
+    row.width_full()
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_center()
+        .padding_left(8)
+        .padding_right(8)
+        .on(ui::Event::Click, &format!("browser.select:{}", entry.path))
+        .disabled_if(busy)
+        .child(left)
+        .child(right)
 }
 
 fn build_inspector(state: &UiSnapshot) -> ui::Element {
@@ -1481,6 +1913,10 @@ fn field(label: &str, value: &str, event_id: &str, placeholder: &str) -> ui::Ele
 
 fn text(content: &str, size: u32) -> ui::Element {
     ui::Element::new(ui::ElementType::P, Some(content)).size(size)
+}
+
+fn span(content: &str, size: u32) -> ui::Element {
+    ui::Element::new(ui::ElementType::Span, Some(content)).size(size)
 }
 
 fn badge(content: &str, color: &str) -> ui::Element {
