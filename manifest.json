@@ -1,13 +1,13 @@
 {
-    "name": "Blank Template",
+    "name": "Conora CRPack Builder",
     "icon": "icon.png",
     "version": "1.0.0",
-    "description": "一个示例 AstroBox 插件",
-    "author": "AstroBox Team",
-    "website": "https://example.com",
-    "entry": "astrobox_ng_plugin_template_rust.wasm",
+    "description": "从手环固件资源树创建 Canopus CRPack v1 主题包",
+    "author": "",
+    "website": "",
+    "entry": "conora_crpack_builder.wasm",
     "wasi_version": 2,
-    "api_level": 3,
-    "permissions": ["network"],
+    "api_level": 4,
+    "permissions": [],
     "additional_files": []
 }

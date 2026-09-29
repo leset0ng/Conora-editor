@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -8,9 +9,12 @@ import zipfile
 from pathlib import Path
 
 
-def run_cargo_build(root_dir, cargo_args):
-    cmd = ["cargo", "build", *cargo_args]
-    result = subprocess.run(cmd, cwd=root_dir)
+def run_cargo_build(root_dir, cargo_args, toolchain=None, env=None):
+    cmd = ["cargo"]
+    if toolchain:
+        cmd.append(f"+{toolchain}")
+    cmd.extend(["build", *cargo_args])
+    result = subprocess.run(cmd, cwd=root_dir, env=env)
     if result.returncode != 0:
         sys.exit(result.returncode)
 
@@ -133,7 +137,17 @@ def main():
     )
     parser.add_argument("--release", action="store_true", help="Use release profile")
     parser.add_argument("--profile", help="Use a specific cargo profile")
-    parser.add_argument("--target", help="Override cargo target triple")
+    parser.add_argument("--toolchain", help="Override the Rust toolchain, e.g. nightly")
+    parser.add_argument(
+        "--build-std",
+        action="store_true",
+        help="Build the Rust standard library for tier-3 targets",
+    )
+    parser.add_argument(
+        "--target",
+        default="wasm32-wasip2",
+        help="Cargo target triple (default: wasm32-wasip2)",
+    )
     parser.add_argument(
         "--package",
         action="store_true",
@@ -153,6 +167,8 @@ def main():
 
     if args.target:
         cargo_args.extend(["--target", args.target])
+    if args.build_std:
+        cargo_args.extend(["-Z", "build-std=std,panic_abort"])
 
     cargo_args.extend(extra)
 
@@ -169,7 +185,43 @@ def main():
     icon = str(manifest.get("icon") or "")
     additional = manifest.get("additional_files") or []
 
-    run_cargo_build(root_dir, cargo_args)
+    build_env = os.environ.copy()
+    reactor_object = None
+    try:
+        if args.build_std and args.target == "wasm32-wasip3":
+            wasi_sdk = build_env.get("WASI_SDK_PATH")
+            if not wasi_sdk:
+                sys.stderr.write(
+                    "WASI_SDK_PATH must point to a wasi-sdk 34+ installation for wasm32-wasip3.\n"
+                )
+                sys.exit(1)
+            wasi_sysroot = Path(wasi_sdk) / "share" / "wasi-sysroot"
+            if not wasi_sysroot.is_dir():
+                sys.stderr.write(f"WASI sysroot not found: {wasi_sysroot}\n")
+                sys.exit(1)
+            library_path = wasi_sysroot / "lib" / "wasm32-wasip3"
+            reactor_source = library_path / "crt1-reactor.o"
+            if not reactor_source.is_file():
+                sys.stderr.write(f"WASI P3 reactor runtime not found in {library_path}\n")
+                sys.exit(1)
+
+            # wasm-component-ld treats the target CRT object as a direct path,
+            # so make it resolvable from Cargo's working directory.
+            reactor_object = root_dir / "crt1-reactor.o"
+            if reactor_object.exists():
+                sys.stderr.write(f"Refusing to overwrite {reactor_object}\n")
+                sys.exit(1)
+            reactor_object.symlink_to(reactor_source)
+
+            flags_key = "CARGO_TARGET_WASM32_WASIP3_RUSTFLAGS"
+            existing_flags = build_env.get(flags_key, "").strip()
+            library_flag = f"-C link-arg=-L{library_path}"
+            build_env[flags_key] = f"{existing_flags} {library_flag}".strip()
+
+        run_cargo_build(root_dir, cargo_args, args.toolchain, build_env)
+    finally:
+        if reactor_object is not None and reactor_object.is_symlink():
+            reactor_object.unlink()
 
     metadata = load_cargo_metadata(root_dir)
     target_dir = Path(metadata.get("target_directory", root_dir / "target"))

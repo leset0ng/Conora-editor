@@ -1,38 +1,38 @@
-# AstroBox NG Plugin Template (Rust)
+# Conora CRPack Builder
 
-一个用于 [AstroBox NG](https://github.com/AstralSightStudios/AstroBox-NG) 的 Rust 插件模板项目。
+AstroBox NG API Level 4 Rust/WASM plugin for creating Canopus Resource Pack (`.crpack`) v1 files from watch firmware.
 
-## 环境准备
+## What it does
 
-### 1. 安装 Rust
+- Opens a firmware `.bin` OTA ZIP/JAR containing `vela_resource.bin`, or a raw ROMFS image.
+- Browses the ROMFS resource tree without changing the source firmware.
+- Previews files recognized as uncompressed LVGL v9 I8 images.
+- Replaces a selected resource with a PNG converted against its original BIN template, or with arbitrary file bytes.
+- Exports only replaced files plus a root `canora.json` manifest as a `.crpack` ZIP.
 
-👉 https://www.rust-lang.org/learn/get-started
+PNG conversion keeps the original dimensions and stride. PNGs with more than 256 RGBA colors require opting into lossy quantization. Unsupported BIN formats remain replaceable as ordinary files, but are not previewed or converted.
 
-### 2. 安装 Python 3
+CRPack export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md`. It validates safe paths, `themeId`, mapping count and generated `mappings.tsv` size, manifest size, file count and the 64 MiB uncompressed package limit. It does not install a pack or send it to the watch.
 
-构建脚本使用 Python 编写，需要安装 Python 3。
+The initial target is Xiaomi Band 11 firmware `4.100.155`; `targets` is inferred from the selected firmware filename when possible and remains editable. ROMFS inputs are limited to 128 MiB. AstroBox's file-picker passes the entire selected archive to the WASM plugin, so the supplied OTA's expanded resource image can temporarily require substantial memory; validate this on the target AstroBox host.
 
-👉 https://www.python.org/downloads/
+## Build
 
-### 3. 安装 wasm32-wasip2 编译目标
+Requires an AstroBox NG host with API Level 4 support.
+
+API Level 4 uses async WIT exports, while the Rust guest standard library must target WASI P2:
 
 ```bash
 rustup target add wasm32-wasip2
+python3 scripts/build_dist.py --release --package
 ```
 
-## 构建
+The `.abp` output is the installable AstroBox plugin. The `.crpack` is generated later from the plugin UI.
+
+## Tests
 
 ```bash
-# Debug 构建到 dist 文件夹
-python scripts/build_dist.py
-
-# Release 构建到 dist 文件夹
-python scripts/build_dist.py --release
-
-# Release 构建并打包为 .abp 插件包
-python scripts/build_dist.py --release --package
+cargo test --target aarch64-apple-darwin
+CONORA_TEST_FIRMWARE="$HOME/develop/temp/miwear.watch.q66tc_v4.100.155_full_f1c824fe.bin" \
+  cargo test --target aarch64-apple-darwin parses_real_firmware_when_requested -- --nocapture
 ```
-
-构建产物会输出到 `dist/` 目录，包含编译后的 wasm 文件、`manifest.json` 和图标。
-
-使用 `--package` 时会额外生成一个 `.abp` 文件，可直接通过 AstroBox 安装。
