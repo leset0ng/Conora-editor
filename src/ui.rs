@@ -1344,7 +1344,8 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
             "soft",
             "gray",
         )
-        .disabled_if(state.busy);
+        .disabled_if(state.busy)
+        .width_full();
 
         let import = button(
             if state.busy {
@@ -1356,7 +1357,8 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
             "soft",
             "gray",
         )
-        .disabled_if(state.busy);
+        .disabled_if(state.busy)
+        .width_full();
 
         let export = button(
             if state.busy {
@@ -1368,26 +1370,37 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
             "solid",
             "accent",
         )
-        .disabled_if(state.busy || state.replacement_count == 0);
+        .disabled_if(state.busy || state.replacement_count == 0)
+        .width_full();
 
-        let actions = ui::Element::new(ui::ElementType::Div, None)
-            .flex()
-            .flex_direction(ui::FlexDirection::Row)
-            .align_center()
+        let actions = ui::Element::new(ui::ElementType::Grid, None)
+            .grid_template_columns("repeat(3, 1fr)")
             .gap(8)
-            .flex_shrink(0.0)
+            .width_full()
             .child(upload)
             .child(import)
             .child(export);
 
+        let display_name = format_firmware_name(&state.firmware_name);
         let summary = ui::Element::new(ui::ElementType::Div, None)
             .flex()
             .flex_direction(ui::FlexDirection::Row)
-            .flex_grow(1.0)
+            .width_full()
             .align_center()
             .gap(8)
-            .child(span("📦", 14))
-            .child(span(&state.firmware_name, 14))
+            .child(
+                ui::Element::new(ui::ElementType::Div, None)
+                    .flex()
+                    .flex_direction(ui::FlexDirection::Row)
+                    .align_center()
+                    .gap(6)
+                    .flex_grow(1.0)
+                    .child(span("📦", 14))
+                    .child(
+                        span(&display_name, 14)
+                            .prop("title", &state.firmware_name),
+                    ),
+            )
             .child(badge(&format!("{} 个文件", state.file_count), "gray"))
             .child(badge(
                 &format!("已替换 {}", state.replacement_count),
@@ -1400,9 +1413,9 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
 
         let toolbar = ui::Element::new(ui::ElementType::Div, None)
             .flex()
-            .flex_direction(ui::FlexDirection::Row)
+            .flex_direction(ui::FlexDirection::Column)
             .width_full()
-            .align_center()
+            .gap(8)
             .child(summary)
             .child(actions);
 
@@ -2045,6 +2058,17 @@ fn field(label: &str, value: &str, event_id: &str, placeholder: &str) -> ui::Ele
         .child(input)
 }
 
+fn format_firmware_name(name: &str) -> String {
+    const MAX_LEN: usize = 28;
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= MAX_LEN {
+        return name.to_string();
+    }
+    let prefix: String = chars[..14].iter().collect();
+    let suffix: String = chars[chars.len() - 12..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
 fn text(content: &str, size: u32) -> ui::Element {
     ui::Element::new(ui::ElementType::P, Some(content)).size(size)
 }
@@ -2102,5 +2126,15 @@ mod tests {
     fn file_extension_ignores_dotfiles_and_normalizes_case() {
         assert_eq!(file_extension("confirm.BIN"), Some("bin".into()));
         assert_eq!(file_extension(".hidden"), None);
+    }
+
+    #[test]
+    fn format_firmware_name_truncates_long_names_with_ellipsis() {
+        assert_eq!(format_firmware_name("short.bin"), "short.bin");
+        let exact_28 = "1234567890123456789012345678";
+        assert_eq!(format_firmware_name(exact_28), exact_28);
+
+        let long_name = "miwear.watch.p67tc_v3.101.043_full_a4ce8564.bin";
+        assert_eq!(format_firmware_name(long_name), "miwear.watch.p…a4ce8564.bin");
     }
 }
