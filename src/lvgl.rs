@@ -37,22 +37,26 @@ struct ParsedImage {
 }
 
 pub fn inspect_i8(data: &[u8]) -> Option<I8Info> {
-    parse_i8(data).ok().map(|parsed| parsed.info)
+    inspect_i8_header(data, data.len())
 }
 
-fn parse_i8(data: &[u8]) -> Result<ParsedImage, String> {
-    if data.len() < PIXEL_OFFSET {
-        return Err("truncated LVGL I8 image".into());
+pub fn inspect_i8_header(header: &[u8], image_size: usize) -> Option<I8Info> {
+    parse_i8_header(header, image_size).ok()
+}
+
+fn parse_i8_header(header: &[u8], image_size: usize) -> Result<I8Info, String> {
+    if header.len() < HEADER_BYTES {
+        return Err("truncated LVGL I8 header".into());
     }
-    if data[0] != 0x19 || data[1] != 0x0a {
+    if header[0] != 0x19 || header[1] != 0x0a {
         return Err("unsupported LVGL magic or color format".into());
     }
 
-    let flags = u16::from_le_bytes([data[2], data[3]]);
-    let width = u16::from_le_bytes([data[4], data[5]]);
-    let height = u16::from_le_bytes([data[6], data[7]]);
-    let stride = u16::from_le_bytes([data[8], data[9]]);
-    let reserved = u16::from_le_bytes([data[10], data[11]]);
+    let flags = u16::from_le_bytes([header[2], header[3]]);
+    let width = u16::from_le_bytes([header[4], header[5]]);
+    let height = u16::from_le_bytes([header[6], header[7]]);
+    let stride = u16::from_le_bytes([header[8], header[9]]);
+    let reserved = u16::from_le_bytes([header[10], header[11]]);
     if flags != 0 || reserved != 0 || width == 0 || height == 0 || stride < width {
         return Err("invalid LVGL I8 header".into());
     }
@@ -64,9 +68,22 @@ fn parse_i8(data: &[u8]) -> Result<ParsedImage, String> {
     let expected = PIXEL_OFFSET
         .checked_add(usize::from(stride) * usize::from(height))
         .ok_or_else(|| "LVGL image size overflow".to_string())?;
-    if expected != data.len() {
+    if expected != image_size {
         return Err("LVGL image size does not match its header".into());
     }
+    Ok(I8Info {
+        width,
+        height,
+        stride,
+    })
+}
+
+fn parse_i8(data: &[u8]) -> Result<ParsedImage, String> {
+    if data.len() < PIXEL_OFFSET {
+        return Err("truncated LVGL I8 image".into());
+    }
+    let info = parse_i8_header(data, data.len())?;
+    let pixel_count = usize::from(info.width) * usize::from(info.height);
 
     let mut palette = [[0u8; 4]; 256];
     for (index, entry) in data[HEADER_BYTES..PIXEL_OFFSET]
@@ -78,18 +95,14 @@ fn parse_i8(data: &[u8]) -> Result<ParsedImage, String> {
         palette[index] = [entry[2], entry[1], entry[0], entry[3]];
     }
 
-    let mut pixels = Vec::with_capacity(pixel_count as usize);
-    for row in 0..usize::from(height) {
-        let start = PIXEL_OFFSET + row * usize::from(stride);
-        pixels.extend_from_slice(&data[start..start + usize::from(width)]);
+    let mut pixels = Vec::with_capacity(pixel_count);
+    for row in 0..usize::from(info.height) {
+        let start = PIXEL_OFFSET + row * usize::from(info.stride);
+        pixels.extend_from_slice(&data[start..start + usize::from(info.width)]);
     }
 
     Ok(ParsedImage {
-        info: I8Info {
-            width,
-            height,
-            stride,
-        },
+        info,
         palette,
         pixels,
     })
@@ -376,6 +389,21 @@ mod tests {
         data[PIXEL_OFFSET + 2..PIXEL_OFFSET + 4].copy_from_slice(&[77, 88]);
         data[PIXEL_OFFSET + 6..PIXEL_OFFSET + 8].copy_from_slice(&[99, 111]);
         data
+    }
+
+    #[test]
+    fn header_inspection_validates_lazy_image_metadata() {
+        let template = sample_template();
+        let info = inspect_i8_header(&template[..HEADER_BYTES], template.len()).unwrap();
+        assert_eq!(
+            info,
+            I8Info {
+                width: 2,
+                height: 2,
+                stride: 4,
+            }
+        );
+        assert!(inspect_i8_header(&template[..HEADER_BYTES], template.len() - 1).is_none());
     }
 
     #[test]

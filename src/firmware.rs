@@ -1,13 +1,14 @@
-use std::collections::{HashMap, HashSet};
-use std::io::{Cursor, Read};
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::{BufReader, Cursor, Read};
+use std::sync::Arc;
 
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::lvgl::{self, I8Info};
 
 const ROMFS_MAGIC: &[u8; 8] = b"-rom1fs-";
-const MAX_INPUT_BYTES: usize = 128 * 1024 * 1024;
-const MAX_ROMFS_BYTES: usize = 128 * 1024 * 1024;
 const MAX_OUTER_ENTRIES: usize = 256;
 const MAX_ROMFS_ENTRIES: usize = 50_000;
 const MAX_RESOURCE_PATH_BYTES: usize = 1024;
@@ -29,41 +30,119 @@ pub struct BrowserEntry {
     pub image: Option<I8Info>,
 }
 
+enum FirmwareSource {
+    RawRomfs(Vec<u8>),
+    Archive {
+        bytes: Vec<u8>,
+        resource_index: usize,
+    },
+}
+
 pub struct FirmwareIndex {
-    resource: Vec<u8>,
+    source: FirmwareSource,
     files: Vec<ResourceFile>,
     file_lookup: HashMap<String, usize>,
     directories: HashSet<String>,
+    last_file_bytes: RefCell<Option<(String, Arc<Vec<u8>>)>>,
 }
 
 impl FirmwareIndex {
-    pub fn from_firmware(input: &[u8]) -> Result<Self, String> {
-        if input.len() > MAX_INPUT_BYTES {
-            return Err(format!(
-                "firmware file exceeds the {} MiB import limit",
-                MAX_INPUT_BYTES / 1024 / 1024
+    pub fn from_firmware(input: Vec<u8>) -> Result<Self, String> {
+        if input.starts_with(ROMFS_MAGIC) {
+            let resource_size = input.len() as u64;
+            let (files, directories) = index_romfs(input.as_slice(), resource_size)?;
+            return Ok(Self::from_parts(
+                FirmwareSource::RawRomfs(input),
+                files,
+                directories,
             ));
         }
-        let resource = extract_resource(input)?;
-        Self::from_romfs(resource)
+
+        let (resource_index, files, directories) = {
+            let mut archive = ZipArchive::new(Cursor::new(input.as_slice()))
+                .map_err(|error| format!("firmware is not a readable ZIP/JAR archive: {error}"))?;
+            if archive.is_empty() || archive.len() > MAX_OUTER_ENTRIES {
+                return Err("firmware archive has an invalid entry count".into());
+            }
+
+            let mut seen = HashSet::with_capacity(archive.len());
+            let mut resource_index = None;
+            for index in 0..archive.len() {
+                let entry = archive
+                    .by_index(index)
+                    .map_err(|error| format!("could not read firmware ZIP entry: {error}"))?;
+                let name = entry.name().to_string();
+                if !seen.insert(name.clone()) {
+                    return Err(format!("firmware ZIP contains duplicate entry: {name}"));
+                }
+                if entry.encrypted() || entry.is_symlink() {
+                    return Err(format!(
+                        "firmware ZIP entry is encrypted or a symlink: {name}"
+                    ));
+                }
+                if !matches!(
+                    entry.compression(),
+                    CompressionMethod::Stored | CompressionMethod::Deflated
+                ) {
+                    return Err(format!(
+                        "firmware ZIP uses an unsupported compression method: {name}"
+                    ));
+                }
+                if name == "vela_resource.bin" {
+                    if entry.is_dir() {
+                        return Err("vela_resource.bin is not a regular file".into());
+                    }
+                    resource_index = Some(index);
+                }
+            }
+
+            let index = resource_index
+                .ok_or_else(|| "firmware archive has no root vela_resource.bin".to_string())?;
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|error| format!("could not open vela_resource.bin: {error}"))?;
+            let resource_size = entry.size();
+            let (files, directories) = index_romfs(&mut entry, resource_size)?;
+            (index, files, directories)
+        };
+
+        Ok(Self::from_parts(
+            FirmwareSource::Archive {
+                bytes: input,
+                resource_index,
+            },
+            files,
+            directories,
+        ))
     }
 
     pub fn from_romfs(resource: Vec<u8>) -> Result<Self, String> {
-        if resource.len() > MAX_ROMFS_BYTES {
-            return Err("ROMFS resource image exceeds the 128 MiB limit".into());
-        }
-        let (files, directories) = index_romfs(&resource)?;
+        let resource_size = resource.len() as u64;
+        let (files, directories) = index_romfs(resource.as_slice(), resource_size)?;
+        Ok(Self::from_parts(
+            FirmwareSource::RawRomfs(resource),
+            files,
+            directories,
+        ))
+    }
+
+    fn from_parts(
+        source: FirmwareSource,
+        files: Vec<ResourceFile>,
+        directories: HashSet<String>,
+    ) -> Self {
         let file_lookup = files
             .iter()
             .enumerate()
             .map(|(index, file)| (file.path.clone(), index))
             .collect();
-        Ok(Self {
-            resource,
+        Self {
+            source,
             files,
             file_lookup,
             directories,
-        })
+            last_file_bytes: RefCell::new(None),
+        }
     }
 
     pub fn file_count(&self) -> usize {
@@ -78,10 +157,20 @@ impl FirmwareIndex {
         self.file_lookup.get(path).map(|index| &self.files[*index])
     }
 
-    pub fn file_bytes(&self, path: &str) -> Option<&[u8]> {
-        let file = self.file(path)?;
-        self.resource
-            .get(file.offset..file.offset.checked_add(file.size)?)
+    pub fn file_bytes(&self, path: &str) -> Result<Option<Arc<Vec<u8>>>, String> {
+        let Some(file) = self.file(path) else {
+            return Ok(None);
+        };
+        if let Some((cached_path, bytes)) = self.last_file_bytes.borrow().as_ref()
+            && cached_path == path
+        {
+            return Ok(Some(Arc::clone(bytes)));
+        }
+
+        self.last_file_bytes.borrow_mut().take();
+        let bytes = Arc::new(self.source.read_range(file.offset, file.size)?);
+        *self.last_file_bytes.borrow_mut() = Some((path.to_string(), Arc::clone(&bytes)));
+        Ok(Some(bytes))
     }
 
     pub fn entries_in_dir(&self, directory: &str) -> Vec<BrowserEntry> {
@@ -174,111 +263,230 @@ impl FirmwareIndex {
     }
 }
 
-fn extract_resource(input: &[u8]) -> Result<Vec<u8>, String> {
-    if input.starts_with(ROMFS_MAGIC) {
-        return Ok(input.to_vec());
-    }
+impl FirmwareSource {
+    fn read_range(&self, offset: usize, size: usize) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).map_err(|error| {
+            format!("could not allocate {size} bytes for the selected resource: {error}")
+        })?;
+        bytes.resize(size, 0);
 
-    let mut archive = ZipArchive::new(Cursor::new(input))
-        .map_err(|error| format!("firmware is not a readable ZIP/JAR archive: {error}"))?;
-    if archive.is_empty() || archive.len() > MAX_OUTER_ENTRIES {
-        return Err("firmware archive has an invalid entry count".into());
-    }
-
-    let mut seen = HashSet::with_capacity(archive.len());
-    let mut resource_index = None;
-    for index in 0..archive.len() {
-        let entry = archive
-            .by_index(index)
-            .map_err(|error| format!("could not read firmware ZIP entry: {error}"))?;
-        let name = entry.name().to_string();
-        if !seen.insert(name.clone()) {
-            return Err(format!("firmware ZIP contains duplicate entry: {name}"));
-        }
-        if entry.encrypted() || entry.is_symlink() {
-            return Err(format!(
-                "firmware ZIP entry is encrypted or a symlink: {name}"
-            ));
-        }
-        if !matches!(
-            entry.compression(),
-            CompressionMethod::Stored | CompressionMethod::Deflated
-        ) {
-            return Err(format!(
-                "firmware ZIP uses an unsupported compression method: {name}"
-            ));
-        }
-        if name == "vela_resource.bin" {
-            if entry.is_dir() {
-                return Err("vela_resource.bin is not a regular file".into());
+        match self {
+            Self::RawRomfs(resource) => {
+                let end = offset
+                    .checked_add(size)
+                    .ok_or_else(|| "selected resource range overflow".to_string())?;
+                let source = resource
+                    .get(offset..end)
+                    .ok_or_else(|| "selected resource range is outside ROMFS".to_string())?;
+                bytes.copy_from_slice(source);
             }
-            resource_index = Some(index);
+            Self::Archive {
+                bytes: archive_bytes,
+                resource_index,
+            } => {
+                let mut archive = ZipArchive::new(Cursor::new(archive_bytes.as_slice()))
+                    .map_err(|error| format!("could not reopen firmware archive: {error}"))?;
+                let mut entry = archive
+                    .by_index(*resource_index)
+                    .map_err(|error| format!("could not reopen vela_resource.bin: {error}"))?;
+                let mut reader = ForwardReader::new(&mut entry);
+                reader.advance_to(offset as u64)?;
+                reader.read_exact(&mut bytes)?;
+            }
         }
-    }
 
-    let index = resource_index
-        .ok_or_else(|| "firmware archive has no root vela_resource.bin".to_string())?;
-    let mut entry = archive
-        .by_index(index)
-        .map_err(|error| format!("could not open vela_resource.bin: {error}"))?;
-    if entry.size() > MAX_ROMFS_BYTES as u64 {
-        return Err("vela_resource.bin exceeds the 128 MiB extraction limit".into());
+        Ok(bytes)
     }
-
-    let expected_size = entry.size() as usize;
-    let mut resource = Vec::with_capacity(expected_size);
-    entry.read_to_end(&mut resource).map_err(|error| {
-        format!("could not extract vela_resource.bin (CRC/Deflate error): {error}")
-    })?;
-    if resource.len() != expected_size {
-        return Err("vela_resource.bin length does not match its ZIP directory".into());
-    }
-    Ok(resource)
 }
 
-fn index_romfs(data: &[u8]) -> Result<(Vec<ResourceFile>, HashSet<String>), String> {
-    if data.len() < 32 || !data.starts_with(ROMFS_MAGIC) {
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum RomfsEvent {
+    Entry { parent: String },
+    ImageHeader { file_index: usize },
+}
+
+struct ForwardReader<R> {
+    inner: BufReader<R>,
+    position: u64,
+}
+
+impl<R: Read> ForwardReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            inner: BufReader::with_capacity(64 * 1024, reader),
+            position: 0,
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn advance_to(&mut self, target: u64) -> Result<(), String> {
+        if target < self.position {
+            return Err("ROMFS contains a backward or overlapping data reference".into());
+        }
+        let mut remaining = target - self.position;
+        let mut scratch = [0u8; 16 * 1024];
+        while remaining > 0 {
+            let count = usize::try_from(remaining.min(scratch.len() as u64))
+                .expect("bounded by scratch buffer");
+            self.read_exact(&mut scratch[..count])?;
+            remaining -= count as u64;
+        }
+        Ok(())
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), String> {
+        self.inner
+            .read_exact(buffer)
+            .map_err(|error| format!("could not read ROMFS data: {error}"))?;
+        self.position = self
+            .position
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| "ROMFS offset overflow".to_string())?;
+        Ok(())
+    }
+
+    fn read_name(&mut self) -> Result<String, String> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            self.read_exact(&mut byte)?;
+            if byte[0] == 0 {
+                break;
+            }
+            if bytes.len() >= MAX_RESOURCE_PATH_BYTES {
+                return Err("ROMFS contains a name longer than the supported limit".into());
+            }
+            bytes.push(byte[0]);
+        }
+        String::from_utf8(bytes).map_err(|_| "ROMFS contains a non-UTF-8 name".into())
+    }
+
+    fn finish(mut self, expected_size: u64) -> Result<(), String> {
+        self.advance_to(expected_size)?;
+        let mut scratch = [0u8; 16 * 1024];
+        loop {
+            let count = self
+                .inner
+                .read(&mut scratch)
+                .map_err(|error| format!("could not finish reading ROMFS data: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            self.position += count as u64;
+        }
+        if self.position != expected_size {
+            return Err("vela_resource.bin length does not match its ZIP directory".into());
+        }
+        Ok(())
+    }
+}
+
+fn index_romfs<R: Read>(
+    reader: R,
+    resource_size: u64,
+) -> Result<(Vec<ResourceFile>, HashSet<String>), String> {
+    let mut reader = ForwardReader::new(reader);
+    if resource_size < 32 {
         return Err("vela_resource.bin is not a ROMFS image".into());
     }
-    let declared = u32::from_be_bytes(data[8..12].try_into().expect("ROMFS size")) as usize;
-    if !(32..=MAX_ROMFS_BYTES).contains(&declared) || declared > data.len() {
+
+    let mut header = [0u8; 16];
+    reader.read_exact(&mut header)?;
+    if &header[..8] != ROMFS_MAGIC {
+        return Err("vela_resource.bin is not a ROMFS image".into());
+    }
+    let declared = u64::from(u32::from_be_bytes(
+        header[8..12].try_into().expect("ROMFS size field"),
+    ));
+    if declared < 32 || declared > resource_size {
         return Err("ROMFS header contains an invalid image size".into());
     }
-    let data = &data[..declared];
-    let (root_name, root_offset) = read_romfs_name(data, 16)?;
+
+    let root_name = reader.read_name()?;
     if root_name.is_empty() || root_name.contains('/') || root_name.contains('\\') {
         return Err("ROMFS root name is invalid".into());
     }
+    let root_offset = align_to_16(reader.position())?;
+    if root_offset < 32 || root_offset >= declared {
+        return Err("ROMFS root directory offset is invalid".into());
+    }
+    reader.advance_to(root_offset)?;
 
-    let mut files = Vec::new();
+    let mut files: Vec<ResourceFile> = Vec::new();
     let mut directories = HashSet::new();
     let mut file_paths = HashSet::new();
     let mut seen_offsets = HashSet::new();
-    let mut pending = vec![(root_offset, String::new())];
+    // Process nodes and image headers in physical order; deflated ZIP members cannot seek.
+    let mut pending = BinaryHeap::new();
+    pending.push(Reverse((
+        root_offset,
+        RomfsEvent::Entry {
+            parent: String::new(),
+        },
+    )));
 
-    while let Some((mut offset, parent)) = pending.pop() {
-        while offset != 0 {
-            if !offset.is_multiple_of(16)
-                || offset < 32
-                || offset.checked_add(16).is_none_or(|end| end > declared)
-            {
-                return Err("ROMFS contains an invalid directory entry offset".into());
+    while let Some(Reverse((offset, event))) = pending.pop() {
+        if offset < reader.position() {
+            return Err("ROMFS contains a backward or overlapping data reference".into());
+        }
+        reader.advance_to(offset)?;
+        match event {
+            RomfsEvent::ImageHeader { file_index } => {
+                let file = files
+                    .get_mut(file_index)
+                    .ok_or_else(|| "ROMFS image index is invalid".to_string())?;
+                let mut image_header = [0u8; 12];
+                reader.read_exact(&mut image_header)?;
+                file.image = lvgl::inspect_i8_header(&image_header, file.size);
             }
-            if !seen_offsets.insert(offset) {
-                return Err("ROMFS directory entries contain a cycle or shared node".into());
-            }
-            if seen_offsets.len() > MAX_ROMFS_ENTRIES {
-                return Err("ROMFS has too many directory entries".into());
-            }
+            RomfsEvent::Entry { parent } => {
+                let offset = usize::try_from(offset)
+                    .map_err(|_| "ROMFS directory offset is too large".to_string())?;
+                if !seen_offsets.insert(offset) {
+                    return Err("ROMFS directory entries contain a cycle or shared node".into());
+                }
+                if seen_offsets.len() > MAX_ROMFS_ENTRIES {
+                    return Err("ROMFS has too many directory entries".into());
+                }
+                if !offset.is_multiple_of(16)
+                    || offset < 32
+                    || (offset as u64)
+                        .checked_add(16)
+                        .is_none_or(|end| end > declared)
+                {
+                    return Err("ROMFS contains an invalid directory entry offset".into());
+                }
 
-            let next = be_u32(data, offset)?;
-            let spec = be_u32(data, offset + 4)? as usize;
-            let size = be_u32(data, offset + 8)? as usize;
-            let (name, content_offset) = read_romfs_name(data, offset + 16)?;
-            let next_offset = (next & !0x0f) as usize;
-            let kind = next & 0x07;
+                let mut entry_header = [0u8; 16];
+                reader.read_exact(&mut entry_header)?;
+                let next = u32::from_be_bytes(entry_header[..4].try_into().expect("next field"));
+                let spec = u32::from_be_bytes(entry_header[4..8].try_into().expect("spec field"));
+                let size = u32::from_be_bytes(entry_header[8..12].try_into().expect("size field"));
+                let name = reader.read_name()?;
+                let content_offset = align_to_16(reader.position())?;
+                if content_offset > declared {
+                    return Err("ROMFS name alignment runs beyond the image".into());
+                }
+                reader.advance_to(content_offset)?;
 
-            if name != "." && name != ".." {
+                let next_offset = (next & !0x0f) as u64;
+                let kind = next & 0x07;
+                if next_offset != 0 {
+                    pending.push(Reverse((
+                        next_offset,
+                        RomfsEvent::Entry {
+                            parent: parent.clone(),
+                        },
+                    )));
+                }
+
+                if name == "." || name == ".." {
+                    continue;
+                }
                 validate_romfs_component(&name)?;
                 let path = if parent.is_empty() {
                     name
@@ -295,20 +503,25 @@ fn index_romfs(data: &[u8]) -> Result<(Vec<ResourceFile>, HashSet<String>), Stri
                             return Err(format!("ROMFS contains a duplicate path: {path}"));
                         }
                         if spec != 0 {
-                            if !spec.is_multiple_of(16)
-                                || spec < 32
-                                || spec.checked_add(16).is_none_or(|end| end > declared)
+                            let child_offset = u64::from(spec);
+                            if !child_offset.is_multiple_of(16)
+                                || child_offset < 32
+                                || child_offset
+                                    .checked_add(16)
+                                    .is_none_or(|end| end > declared)
                             {
                                 return Err(format!(
                                     "ROMFS directory {path} has an invalid child pointer"
                                 ));
                             }
-                            pending.push((spec, path));
+                            pending
+                                .push(Reverse((child_offset, RomfsEvent::Entry { parent: path })));
                         }
                     }
                     2 => {
+                        let size = size as usize;
                         let end = content_offset
-                            .checked_add(size)
+                            .checked_add(size as u64)
                             .ok_or_else(|| format!("ROMFS file {path} size overflow"))?;
                         if end > declared {
                             return Err(format!("ROMFS file {path} is truncated"));
@@ -316,25 +529,39 @@ fn index_romfs(data: &[u8]) -> Result<(Vec<ResourceFile>, HashSet<String>), Stri
                         if directories.contains(&path) || !file_paths.insert(path.clone()) {
                             return Err(format!("ROMFS contains a duplicate path: {path}"));
                         }
-                        let image = lvgl::inspect_i8(&data[content_offset..end]);
+                        let file_index = files.len();
                         files.push(ResourceFile {
                             path,
                             size,
-                            image,
-                            offset: content_offset,
+                            image: None,
+                            offset: usize::try_from(content_offset)
+                                .map_err(|_| "ROMFS file offset is too large".to_string())?,
                         });
+                        if size >= 12 {
+                            pending.push(Reverse((
+                                content_offset,
+                                RomfsEvent::ImageHeader { file_index },
+                            )));
+                        }
                     }
                     _ => {
                         // Symlinks and special filesystem entries are not followed or exposed.
                     }
                 }
             }
-            offset = next_offset;
         }
     }
 
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    reader.finish(resource_size)?;
     Ok((files, directories))
+}
+
+fn align_to_16(offset: u64) -> Result<u64, String> {
+    offset
+        .checked_add(15)
+        .map(|value| value & !15)
+        .ok_or_else(|| "ROMFS offset overflow".into())
 }
 
 fn validate_romfs_component(name: &str) -> Result<(), String> {
@@ -349,35 +576,6 @@ fn validate_romfs_component(name: &str) -> Result<(), String> {
         return Err(format!("ROMFS contains an unsafe path component: {name:?}"));
     }
     Ok(())
-}
-
-fn read_romfs_name(data: &[u8], offset: usize) -> Result<(String, usize), String> {
-    if offset >= data.len() {
-        return Err("ROMFS name starts outside the image".into());
-    }
-    let end = data[offset..]
-        .iter()
-        .position(|byte| *byte == 0)
-        .map(|relative| offset + relative)
-        .ok_or_else(|| "ROMFS contains an unterminated name".to_string())?;
-    let name = std::str::from_utf8(&data[offset..end])
-        .map_err(|_| "ROMFS contains a non-UTF-8 name".to_string())?
-        .to_string();
-    let aligned = end
-        .checked_add(16)
-        .map(|value| value & !15)
-        .ok_or_else(|| "ROMFS name offset overflow".to_string())?;
-    if aligned > data.len() {
-        return Err("ROMFS name alignment runs beyond the image".into());
-    }
-    Ok((name, aligned))
-}
-
-fn be_u32(data: &[u8], offset: usize) -> Result<u32, String> {
-    let bytes = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| "ROMFS integer is truncated".to_string())?;
-    Ok(u32::from_be_bytes(bytes.try_into().expect("four bytes")))
 }
 
 #[cfg(test)]
@@ -422,7 +620,10 @@ mod tests {
         let index = FirmwareIndex::from_romfs(image).unwrap();
         assert_eq!(index.file_count(), 1);
         let file = index.file("app/icons/test.bin").unwrap();
-        assert_eq!(index.file_bytes(&file.path), Some(&b"test"[..]));
+        assert_eq!(
+            index.file_bytes(&file.path).unwrap().unwrap().as_slice(),
+            b"test"
+        );
         assert_eq!(index.entries_in_dir("app")[0].name, "icons");
         assert!(
             index
@@ -436,14 +637,22 @@ mod tests {
     fn extracts_the_root_resource_from_a_jar() {
         let romfs = synthetic_romfs();
         let bytes = zip_with_file("vela_resource.bin", &romfs);
-        let index = FirmwareIndex::from_firmware(&bytes).unwrap();
+        let index = FirmwareIndex::from_firmware(bytes).unwrap();
         assert_eq!(index.file_count(), 1);
+        assert_eq!(
+            index
+                .file_bytes("app/icons/test.bin")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"test"
+        );
     }
 
     #[test]
     fn rejects_an_archive_without_the_resource_image() {
         let bytes = zip_with_file("other.bin", b"not a ROMFS");
-        assert!(FirmwareIndex::from_firmware(&bytes).is_err());
+        assert!(FirmwareIndex::from_firmware(bytes).is_err());
     }
 
     #[test]
@@ -452,7 +661,7 @@ mod tests {
             return;
         };
         let firmware = std::fs::read(path).expect("read requested firmware test fixture");
-        let index = FirmwareIndex::from_firmware(&firmware).expect("parse requested firmware");
+        let index = FirmwareIndex::from_firmware(firmware).expect("parse requested firmware");
         assert!(index.file_count() > 1_000);
         let images = index
             .files()
@@ -466,11 +675,44 @@ mod tests {
         );
         let confirm = index
             .file_bytes("app/common/icon/confirm.bin")
+            .expect("read sample confirm image")
             .expect("fixture contains the sample confirm image");
-        let (info, png) = lvgl::decode_i8_png(confirm).expect("decode real LVGL I8 image");
+        let (info, png) =
+            lvgl::decode_i8_png(confirm.as_slice()).expect("decode real LVGL I8 image");
         assert_eq!((info.width, info.height), (48, 48));
-        let restored = lvgl::encode_png_i8(&png, confirm, false)
+        let restored = lvgl::encode_png_i8(&png, confirm.as_slice(), false)
             .expect("re-encode the original PNG losslessly");
-        assert_eq!(restored, confirm);
+        assert_eq!(restored.as_slice(), confirm.as_slice());
+    }
+
+    #[test]
+    fn parses_large_firmware_when_requested() {
+        let Some(path) = std::env::var_os("CONORA_TEST_LARGE_FIRMWARE") else {
+            return;
+        };
+        let firmware = std::fs::read(path).expect("read requested large firmware fixture");
+        let index = FirmwareIndex::from_firmware(firmware).expect("parse requested large firmware");
+        let images = index
+            .files()
+            .iter()
+            .filter(|file| file.image.is_some())
+            .count();
+        eprintln!(
+            "Indexed {} firmware files and {} LVGL I8 images",
+            index.file_count(),
+            images
+        );
+        assert!(index.file_count() > 5_000);
+        let image = index
+            .files()
+            .iter()
+            .find(|file| file.image.is_some())
+            .expect("large fixture contains an LVGL I8 image");
+        let image_bytes = index
+            .file_bytes(&image.path)
+            .expect("lazily read selected image")
+            .expect("image path exists");
+        assert_eq!(image_bytes.len(), image.size);
+        assert_eq!(lvgl::inspect_i8(image_bytes.as_slice()), image.image);
     }
 }

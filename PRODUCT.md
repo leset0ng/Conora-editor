@@ -34,7 +34,7 @@ The user selects a local OTA firmware archive, browses its resource tree, select
 - Non-image replacements are copied as file bytes; their device-specific format is not inferred or certified.
 - Export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md` CRPack v1: root `canora.json`, only replacement assets, safe paths, no `mappings.tsv`, and documented file/size/rule limits.
 - `.crpack` export is separate from AstroBox `.abp` plugin packaging and does not install or transmit resources to the watch.
-- The AstroBox file-picker returns the complete selected file as bytes. Peak memory for the supplied OTA and expanded ROMFS must be validated on the actual host.
+- The AstroBox file-picker returns the complete selected archive as bytes. The importer streams ROMFS metadata and lazily loads selected resources rather than retaining an expanded ROMFS; compressed entries may incur additional inflate latency when loading files. Validate guest memory and responsiveness on the actual host.
 
 ## Evidence on Hand
 

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use astrobox_ng_wit::astrobox::psys_host_v4::{self as psys_host, ui};
 use base64::Engine;
@@ -376,8 +376,12 @@ async fn begin_firmware_pick() {
     }
 
     let file_name = picked.name.clone();
-    let result = FirmwareIndex::from_firmware(&picked.data);
-    drop(picked.data);
+    {
+        let mut state = lock_state();
+        state.status = format!("正在流式索引固件资源：{file_name}");
+    }
+    render_current();
+    let result = FirmwareIndex::from_firmware(picked.data);
     match result {
         Ok(firmware) => {
             let count = firmware.file_count();
@@ -422,18 +426,26 @@ async fn begin_png_pick() {
             render_current();
             return;
         };
-        let Some(template) = state
+        let template = match state
             .firmware
             .as_ref()
-            .and_then(|firmware| firmware.file_bytes(&path))
-            .map(<[u8]>::to_vec)
-        else {
-            state.error = Some("无法读取原始图片模板。".into());
-            drop(state);
-            render_current();
-            return;
+            .map(|firmware| firmware.file_bytes(&path))
+        {
+            Some(Ok(Some(template))) => template,
+            Some(Ok(None)) | None => {
+                state.error = Some("无法读取原始图片模板。".into());
+                drop(state);
+                render_current();
+                return;
+            }
+            Some(Err(error)) => {
+                state.error = Some(format!("无法读取原始图片模板：{error}"));
+                drop(state);
+                render_current();
+                return;
+            }
         };
-        if lvgl::inspect_i8(&template).is_none() {
+        if lvgl::inspect_i8(template.as_slice()).is_none() {
             state.error = Some("此文件不是受支持的 LVGL v9 I8 图片。".into());
             drop(state);
             render_current();
@@ -474,7 +486,8 @@ async fn begin_png_pick() {
     };
 
     if !picked.data.is_empty() {
-        let result = lvgl::encode_png_i8_detailed(&picked.data, &template, allow_quantize);
+        let result =
+            lvgl::encode_png_i8_detailed(&picked.data, template.as_slice(), allow_quantize);
         match result {
             Ok(encoded) => {
                 let size = encoded.bytes.len();
@@ -599,24 +612,37 @@ fn restore_selected() {
             return;
         };
         state.replacements.remove(&path);
-        state.preview_uri = state
+        let original = state
             .firmware
             .as_ref()
-            .and_then(|firmware| {
+            .filter(|firmware| {
                 firmware
                     .file(&path)
-                    .filter(|file| file.image.is_some())
-                    .and_then(|_| firmware.file_bytes(&path))
+                    .is_some_and(|file| file.image.is_some())
             })
-            .and_then(|bytes| preview_from_bytes(bytes).0);
+            .map(|firmware| firmware.file_bytes(&path));
+        match original {
+            Some(Ok(Some(bytes))) => {
+                let (preview_uri, preview_error) = preview_from_bytes(bytes.as_slice());
+                state.preview_uri = preview_uri;
+                state.error = preview_error;
+            }
+            Some(Err(error)) => {
+                state.preview_uri = None;
+                state.error = Some(format!("无法读取固件原始资源：{error}"));
+            }
+            _ => {
+                state.preview_uri = None;
+                state.error = None;
+            }
+        }
         state.status = "已恢复固件中的原始资源。".into();
-        state.error = None;
     }
     render_current();
 }
 
 fn select_file(path: &str) {
-    let bytes = {
+    let (bytes, read_error) = {
         let mut state = lock_state();
         if state.busy {
             return;
@@ -629,27 +655,39 @@ fn select_file(path: &str) {
         else {
             return;
         };
+
+        let mut read_error = None;
         let replacement = state.replacements.get(path);
         let bytes = if let Some(replacement) = replacement {
-            lvgl::inspect_i8(replacement).map(|_| replacement.clone())
+            lvgl::inspect_i8(replacement).map(|_| Arc::new(replacement.clone()))
         } else if template_is_image {
-            state
+            match state
                 .firmware
                 .as_ref()
-                .and_then(|firmware| firmware.file_bytes(path))
-                .map(<[u8]>::to_vec)
+                .map(|firmware| firmware.file_bytes(path))
+            {
+                Some(Ok(Some(bytes))) => Some(bytes),
+                Some(Ok(None)) | None => None,
+                Some(Err(error)) => {
+                    read_error = Some(format!("无法读取固件原始资源：{error}"));
+                    None
+                }
+            }
         } else {
             None
         };
         state.selected_path = Some(path.to_string());
         state.status = format!("已选择 /resource/{path} · {}", format_bytes(file_size));
-        state.error = None;
-        bytes
+        state.error = read_error.clone();
+        (bytes, read_error)
     };
-    let preview_uri = bytes.as_deref().and_then(|data| preview_from_bytes(data).0);
+    let (preview_uri, preview_error) = bytes
+        .as_deref()
+        .map_or((None, None), |data| preview_from_bytes(data.as_slice()));
     {
         let mut state = lock_state();
         state.preview_uri = preview_uri;
+        state.error = read_error.or(preview_error);
     }
     render_current();
 }

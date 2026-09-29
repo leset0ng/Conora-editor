@@ -14,7 +14,7 @@ PNG conversion keeps the original dimensions and stride. PNGs with more than 256
 
 CRPack export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md`. It validates safe paths, `themeId`, mapping count and generated `mappings.tsv` size, manifest size, file count and the 64 MiB uncompressed package limit. It does not install a pack or send it to the watch.
 
-The initial target is Xiaomi Band 11 firmware `4.100.155`; `targets` is inferred from the selected firmware filename when possible and remains editable. ROMFS inputs are limited to 128 MiB. AstroBox's file-picker passes the entire selected archive to the WASM plugin, so the supplied OTA's expanded resource image can temporarily require substantial memory; validate this on the target AstroBox host.
+The initial target is Xiaomi Band 11 firmware `4.100.155`; `targets` is inferred from the selected firmware filename when possible and remains editable. The importer streams the ROMFS tree into metadata and reads original file bytes lazily; it does not keep a full expanded ROMFS in memory. AstroBox's file-picker still passes the complete compressed archive to the WASM plugin. For deflated ROMFS entries, loading a selected file may need to inflate the stream up to that file's offset, trading latency for lower memory use. Actual imports remain subject to available host memory.
 
 ## Build
 
