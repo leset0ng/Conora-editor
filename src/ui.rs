@@ -293,6 +293,7 @@ async fn process_click(event_id: &str) {
     }
     match event_id {
         "firmware.upload" => begin_firmware_pick().await,
+        "pack.import" => begin_crpack_pick().await,
         "pack.export" => begin_export().await,
         "resource.extract" => begin_resource_extract(false).await,
         "resource.extract.png" => begin_resource_extract(true).await,
@@ -543,6 +544,126 @@ async fn begin_firmware_pick() {
         }
     }
     render_current();
+}
+
+async fn begin_crpack_pick() {
+    {
+        let mut state = lock_state();
+        if state.busy {
+            return;
+        }
+        if state.firmware.is_none() {
+            state.error = Some("请先加载手环固件再导入 CRPack。".into());
+            drop(state);
+            render_current();
+            return;
+        }
+        state.busy = true;
+        state.error = None;
+        state.status = "等待选择 CRPack 文件…".into();
+    }
+    render_current();
+
+    let picked = match psys_host::dialog::pick_file(
+        psys_host::dialog::PickConfig {
+            read: true,
+            copy_to: None,
+        },
+        psys_host::dialog::FilterConfig {
+            multiple: false,
+            extensions: vec!["crpack".into(), "zip".into()],
+            default_directory: String::new(),
+            default_file_name: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(picked) => picked,
+        Err(error) => {
+            {
+                let mut state = lock_state();
+                state.busy = false;
+                state.status = "无法打开 CRPack 选择器。".into();
+                state.error = Some(format!("选择 CRPack 失败：{error}"));
+            }
+            render_current();
+            return;
+        }
+    };
+
+    if picked.data.is_empty() {
+        {
+            let mut state = lock_state();
+            state.busy = false;
+            state.status = "没有读取到 CRPack 文件；可以重新选择。".into();
+        }
+        render_current();
+        return;
+    }
+
+    let file_name = picked.name.clone();
+    {
+        let mut state = lock_state();
+        state.status = format!("正在解析 CRPack：{file_name}");
+    }
+    render_current();
+
+    let result = crpack::parse_crpack(&picked.data);
+    let selected_refresh_path = match result {
+        Ok(unpacked) => {
+            let mut state = lock_state();
+            state.theme_id = unpacked.theme_id;
+            state.pack_name = unpacked.name;
+            state.version = unpacked.version.unwrap_or_default();
+            state.author = unpacked.author.unwrap_or_default();
+            state.description = unpacked.description.unwrap_or_default();
+            if let Some(target) = unpacked.target {
+                if !target.is_empty() {
+                    state.target = target;
+                }
+            }
+
+            // Strategy B: completely reset existing replacements and use the imported ones
+            state.replacements = unpacked.replacements;
+            state.filter_mode = ResourceFilter::Replaced;
+            state.search_query.clear();
+            state.busy = false;
+
+            let count = state.replacements.len();
+            let missing_in_firmware_count = state.firmware.as_ref().map_or(0, |fw| {
+                state
+                    .replacements
+                    .keys()
+                    .filter(|path| fw.file(path).is_none())
+                    .count()
+            });
+
+            if missing_in_firmware_count > 0 {
+                state.status = format!(
+                    "已导入「{}」，包含 {} 个资源（其中 {} 个在当前固件中未找到）。",
+                    state.pack_name, count, missing_in_firmware_count
+                );
+            } else {
+                state.status = format!("已导入「{}」，包含 {} 个资源。", state.pack_name, count);
+            }
+            state.error = None;
+
+            state.selected_path.clone()
+        }
+        Err(error) => {
+            let mut state = lock_state();
+            state.busy = false;
+            state.status = "CRPack 未能导入。".into();
+            state.error = Some(format!("CRPack 解析失败：{error}"));
+            None
+        }
+    };
+
+    if let Some(path) = selected_refresh_path {
+        select_file(&path);
+    } else {
+        render_current();
+    }
 }
 
 async fn begin_png_pick() {
@@ -1225,6 +1346,18 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
         )
         .disabled_if(state.busy);
 
+        let import = button(
+            if state.busy {
+                "处理中…"
+            } else {
+                "导入 .crpack"
+            },
+            "pack.import",
+            "soft",
+            "gray",
+        )
+        .disabled_if(state.busy);
+
         let export = button(
             if state.busy {
                 "处理中…"
@@ -1244,6 +1377,7 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
             .gap(8)
             .flex_shrink(0.0)
             .child(upload)
+            .child(import)
             .child(export);
 
         let summary = ui::Element::new(ui::ElementType::Div, None)

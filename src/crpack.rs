@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 
 use serde_json::{Map, Value, json};
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const MAX_FILES: usize = 128;
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -12,6 +12,17 @@ const MAX_MAPPINGS: usize = 64;
 const MAX_CONFIG_BYTES: usize = 32 * 1024;
 const MAX_PATH_BYTES: usize = 256;
 const THEME_ROOT: &str = "/data/quickapp/files/ng.lst.corona/themes/";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnpackedCrpack {
+    pub theme_id: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub author: Option<String>,
+    pub description: Option<String>,
+    pub target: Option<String>,
+    pub replacements: BTreeMap<String, Vec<u8>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct PackOptions<'a> {
@@ -136,6 +147,155 @@ pub fn build_crpack(options: &PackOptions<'_>) -> Result<Vec<u8>, String> {
         .finish()
         .map(|cursor| cursor.into_inner())
         .map_err(|error| format!("could not finish CRPack ZIP: {error}"))
+}
+
+pub fn parse_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
+    if bytes.len() > MAX_TOTAL_BYTES {
+        return Err("CRPack exceeds the 64 MiB limit".into());
+    }
+
+    let cursor = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|error| format!("could not open CRPack archive: {error}"))?;
+
+    if archive.len() > MAX_FILES {
+        return Err(format!(
+            "CRPack contains {} entries, exceeding the maximum of {}",
+            archive.len(),
+            MAX_FILES
+        ));
+    }
+
+    let mut manifest_bytes = Vec::new();
+    {
+        let mut manifest_file = archive
+            .by_name("canora.json")
+            .map_err(|_| "missing canora.json in CRPack".to_string())?;
+        if manifest_file.size() > MAX_MANIFEST_BYTES as u64 {
+            return Err("canora.json exceeds the 64 KiB CRPack v1 limit".into());
+        }
+        manifest_file
+            .read_to_end(&mut manifest_bytes)
+            .map_err(|error| format!("could not read canora.json: {error}"))?;
+    }
+
+    if manifest_bytes.len() > MAX_MANIFEST_BYTES {
+        return Err("canora.json exceeds the 64 KiB CRPack v1 limit".into());
+    }
+
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid canora.json: {error}"))?;
+
+    let manifest_obj = manifest
+        .as_object()
+        .ok_or_else(|| "canora.json must be a JSON object".to_string())?;
+
+    let format_str = manifest_obj
+        .get("format")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "canora.json missing 'format'".to_string())?;
+    if format_str != "canopus-resource-pack" {
+        return Err(format!("unsupported format in canora.json: {format_str}"));
+    }
+
+    let format_version = manifest_obj
+        .get("formatVersion")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "canora.json missing or invalid 'formatVersion'".to_string())?;
+    if format_version != 1 {
+        return Err(format!(
+            "unsupported formatVersion in canora.json: {format_version}"
+        ));
+    }
+
+    let theme_id = manifest_obj
+        .get("themeId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "canora.json missing 'themeId'".to_string())?
+        .to_string();
+    validate_theme_id(&theme_id)?;
+
+    let name = manifest_obj
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "canora.json missing 'name'".to_string())?
+        .to_string();
+    validate_text(&name, "name", 128, true)?;
+
+    let version = manifest_obj
+        .get("version")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    validate_optional_text(version.as_deref(), "version", 64)?;
+
+    let author = manifest_obj
+        .get("author")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    validate_optional_text(author.as_deref(), "author", 128)?;
+
+    let description = manifest_obj
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    validate_optional_text(description.as_deref(), "description", 1024)?;
+
+    let target = manifest_obj
+        .get("targets")
+        .and_then(Value::as_array)
+        .and_then(|targets| targets.first())
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    if let Some(target_str) = &target {
+        validate_text(target_str, "targets[0]", 128, true)?;
+    }
+
+    let mut replacements = BTreeMap::new();
+    let mut total_bytes = manifest_bytes.len();
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|error| format!("failed to read ZIP entry #{i}: {error}"))?;
+        let raw_name = file.name().to_string();
+
+        if file.is_dir() || raw_name.ends_with('/') {
+            continue;
+        }
+
+        if raw_name == "canora.json" || raw_name == "mappings.tsv" {
+            continue;
+        }
+
+        validate_relative_path(&raw_name)?;
+
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|error| format!("failed to extract {raw_name}: {error}"))?;
+
+        total_bytes = total_bytes
+            .checked_add(contents.len())
+            .ok_or_else(|| "total byte count overflow".to_string())?;
+        if total_bytes > MAX_TOTAL_BYTES {
+            return Err("unpacked CRPack contents exceed the 64 MiB limit".into());
+        }
+
+        replacements.insert(raw_name, contents);
+    }
+
+    if replacements.is_empty() {
+        return Err("CRPack does not contain any replacement files".into());
+    }
+
+    Ok(UnpackedCrpack {
+        theme_id,
+        name,
+        version,
+        author,
+        description,
+        target,
+        replacements,
+    })
 }
 
 fn mappings_for_paths<'a>(paths: impl Iterator<Item = &'a String>) -> Result<Vec<Mapping>, String> {
@@ -362,5 +522,73 @@ mod tests {
         let mut replacements = BTreeMap::new();
         replacements.insert("app/file.bin".into(), vec![0; MAX_TOTAL_BYTES]);
         assert!(build_crpack(&options(&replacements)).is_err());
+    }
+
+    #[test]
+    fn parses_exported_crpack_roundtrip() {
+        let mut replacements = BTreeMap::new();
+        replacements.insert("app/common/icon/confirm.bin".into(), vec![1, 2, 3]);
+        replacements.insert("app/settings/launcher.bin".into(), vec![4, 5]);
+        let pack_opts = PackOptions {
+            theme_id: "test_pack",
+            name: "Test Theme",
+            version: Some("1.2.3"),
+            author: Some("Tester"),
+            description: Some("Description of test"),
+            target: Some("xiaomi-band-11-4.100.155"),
+            replacements: &replacements,
+        };
+        let bytes = build_crpack(&pack_opts).unwrap();
+        let unpacked = parse_crpack(&bytes).unwrap();
+
+        assert_eq!(unpacked.theme_id, "test_pack");
+        assert_eq!(unpacked.name, "Test Theme");
+        assert_eq!(unpacked.version.as_deref(), Some("1.2.3"));
+        assert_eq!(unpacked.author.as_deref(), Some("Tester"));
+        assert_eq!(unpacked.description.as_deref(), Some("Description of test"));
+        assert_eq!(unpacked.target.as_deref(), Some("xiaomi-band-11-4.100.155"));
+        assert_eq!(unpacked.replacements, replacements);
+    }
+
+    #[test]
+    fn parse_crpack_rejects_malformed_archive_and_missing_manifest() {
+        assert!(parse_crpack(&[]).is_err());
+        assert!(parse_crpack(b"not a zip file").is_err());
+
+        // Create zip without canora.json
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let file_options = SimpleFileOptions::default();
+        writer.start_file("app/test.bin", file_options).unwrap();
+        writer.write_all(b"123").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let err = parse_crpack(&bytes).unwrap_err();
+        assert!(err.contains("missing canora.json"));
+    }
+
+    #[test]
+    fn parse_crpack_rejects_unsafe_paths_and_empty_replacements() {
+        // Zip with only canora.json (no replacements)
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let file_options = SimpleFileOptions::default();
+        writer.start_file("canora.json", file_options).unwrap();
+        let manifest = json!({
+            "format": "canopus-resource-pack",
+            "formatVersion": 1,
+            "themeId": "safe_theme",
+            "name": "Safe Theme",
+        });
+        writer.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let err = parse_crpack(&bytes).unwrap_err();
+        assert!(err.contains("does not contain any replacement"));
+
+        // Zip with path traversal
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file("canora.json", file_options).unwrap();
+        writer.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        writer.start_file("../unsafe.bin", file_options).unwrap();
+        writer.write_all(b"evil").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        assert!(parse_crpack(&bytes).is_err());
     }
 }
