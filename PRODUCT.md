@@ -30,7 +30,7 @@ The user selects a local OTA firmware archive, browses its resource tree, select
 
 - Initial validation target is the supplied Xiaomi Band 11 firmware `4.100.155`.
 - The input OTA is a ZIP/JAR containing `vela_resource.bin`, which contains a ROMFS resource tree.
-- Automatic image preview and PNG conversion are limited to validated uncompressed LVGL v9 I8 images; PNG dimensions must match the source template. Lossy quantization must be explicit.
+- Automatic image preview and bidirectional PNG conversion support LVGL v9 (I8, A8, ARGB8888, I4, A4; uncompressed and RLE-compressed), LVGL v8 (RGB565, I8), PNG, and JPEG; PNG dimensions must match the source template. Lossy quantization must be explicit.
 - Non-image replacements are copied as file bytes; their device-specific format is not inferred or certified.
 - Export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md` CRPack v1: root `canora.json`, only replacement assets, safe paths, no `mappings.tsv`, and documented file/size/rule limits.
 - `.crpack` export is separate from AstroBox `.abp` plugin packaging and does not install or transmit resources to the watch.

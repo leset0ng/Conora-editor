@@ -280,9 +280,22 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
             state
                 .replacements
                 .get(path)
-                .and_then(|bytes| lvgl::inspect_i8(bytes))
+                .and_then(|bytes| lvgl::inspect_image(bytes))
+        } else if let Some(file) = selected {
+            if let Some(mut info) = file.image {
+                if info.width == 0 && info.height == 0 {
+                    if let Ok(Some(bytes)) = state.firmware.as_ref().unwrap().file_bytes(path) {
+                        if let Some(inspected) = lvgl::inspect_image(bytes.as_slice()) {
+                            info = inspected;
+                        }
+                    }
+                }
+                Some(info)
+            } else {
+                None
+            }
         } else {
-            selected.and_then(|file| file.image)
+            None
         }
     });
     let selected_template_image = selected.is_some_and(|file| file.image.is_some());
@@ -369,7 +382,7 @@ async fn process_click(event_id: &str) {
             {
                 let mut state = lock_state();
                 state.filter_mode = ResourceFilter::Images;
-                state.status = "仅显示 LVGL 图片资源。".into();
+                state.status = "仅显示图片资源。".into();
                 state.error = None;
             }
             render_current();
@@ -724,7 +737,7 @@ async fn begin_png_pick() {
             return;
         }
         let Some(path) = state.selected_path.clone() else {
-            state.error = Some("请先从文件树选择一个 LVGL 图片。".into());
+            state.error = Some("请先从文件树选择一个图片资源。".into());
             drop(state);
             render_current();
             return;
@@ -748,8 +761,8 @@ async fn begin_png_pick() {
                 return;
             }
         };
-        if lvgl::inspect_i8(template.as_slice()).is_none() {
-            state.error = Some("此文件不是受支持的 LVGL v9 I8 图片。".into());
+        if lvgl::inspect_image(template.as_slice()).is_none() {
+            state.error = Some("此文件不是受支持的图片资源。".into());
             drop(state);
             render_current();
             return;
@@ -789,8 +802,11 @@ async fn begin_png_pick() {
     };
 
     if !picked.data.is_empty() {
+        let format_name = lvgl::inspect_image(template.as_slice())
+            .map(|info| info.format.display_name())
+            .unwrap_or("目标格式");
         let result =
-            lvgl::encode_png_i8_detailed(&picked.data, template.as_slice(), allow_quantize);
+            lvgl::encode_png_to_template_detailed(&picked.data, template.as_slice(), allow_quantize);
         match result {
             Ok(encoded) => {
                 let size = encoded.bytes.len();
@@ -807,7 +823,7 @@ async fn begin_png_pick() {
                 state.preview_uri = preview_uri;
                 state.busy = false;
                 state.status = format!(
-                    "已将 PNG 转换为 LVGL I8 BIN（{}{quantize_status}）。",
+                    "已将 PNG 转换为 {format_name}（{}{quantize_status}）。",
                     format_bytes(size)
                 );
                 state.error = preview_error;
@@ -1153,11 +1169,11 @@ async fn begin_resource_extract(as_png: bool) {
             return;
         }
     };
-    if as_png && lvgl::inspect_i8(bytes.as_slice()).is_none() {
+    if as_png && lvgl::inspect_image(bytes.as_slice()).is_none() {
         let mut state = lock_state();
         state.busy = false;
         state.status = "资源提取未完成。".into();
-        state.error = Some("此资源不是受支持的 LVGL v9 I8 图片，无法转换为 PNG。".into());
+        state.error = Some("此资源不是受支持的图片，无法转换为 PNG。".into());
         drop(state);
         render_current();
         return;
@@ -1175,11 +1191,11 @@ async fn begin_resource_extract(as_png: bool) {
         file_extension(&file_name)
     };
     let result = if as_png {
-        match lvgl::decode_i8_png(bytes.as_slice()) {
+        match lvgl::decode_image_png(bytes.as_slice()) {
             Ok((_, png)) => save_resource_file(&png, &file_name, extension.as_deref())
                 .await
                 .map(|()| png.len()),
-            Err(error) => Err(format!("BIN 转 PNG 失败：{error}")),
+            Err(error) => Err(format!("图片转 PNG 失败：{error}")),
         }
     } else {
         save_resource_file(bytes.as_slice(), &file_name, extension.as_deref())
@@ -1614,7 +1630,7 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
         let empty_tip = if state.filter_mode == ResourceFilter::Replaced {
             "暂无已替换资源。可从文件树选择文件，在右侧替换 PNG 或二进制。"
         } else if state.filter_mode == ResourceFilter::Images {
-            "当前目录下没有 LVGL 图片资源。"
+            "当前目录下没有图片资源。"
         } else if !state.search_query.is_empty() {
             "没有找到匹配的资源。"
         } else {
@@ -1982,7 +1998,13 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
                         "固件原始资源"
                     },
                     image_info
-                        .map(|info| format!(" · {}×{} LVGL I8", info.width, info.height))
+                        .map(|info| {
+                            if info.width > 0 && info.height > 0 {
+                                format!(" · {}×{} {}", info.width, info.height, info.format.display_name())
+                            } else {
+                                format!(" · {}", info.format.display_name())
+                            }
+                        })
                         .unwrap_or_default(),
                 ),
                 12,
@@ -2005,9 +2027,9 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
         } else {
             selection = selection.child(text(
                 if state.selected_replaced {
-                    "此替换文件不是可预览的 LVGL I8 图片。"
+                    "此替换文件不是可预览的图片。"
                 } else {
-                    "此资源不是受支持的 LVGL v9 I8 图片。"
+                    "此资源不是受支持的图片格式。"
                 },
                 13,
             ));
@@ -2061,7 +2083,7 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
                     .align_center()
                     .gap(8)
                     .child(checkbox)
-                    .child(text("允许超过 256 色时进行有损量化", 13)),
+                    .child(text("允许调色板颜色超限时进行有损量化", 13)),
             );
         }
         if state.selected_replaced {
@@ -2070,7 +2092,7 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
             );
         }
     } else {
-        content = content.child(text("选择左侧文件；LVGL I8 图片会显示预览。", 14));
+        content = content.child(text("选择左侧文件；图片资源会显示预览。", 14));
     }
 
     content = content.child(ui::Element::new(ui::ElementType::Separator, None));

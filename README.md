@@ -6,9 +6,9 @@ AstroBox NG API Level 4 Rust/WASM plugin for creating Canopus Resource Pack (`.c
 
 - Opens a firmware `.bin` OTA ZIP/JAR containing `vela_resource.bin`, or a raw ROMFS image.
 - Browses the ROMFS resource tree without changing the source firmware.
-- Previews files recognized as uncompressed LVGL v9 I8 images.
-- Extracts the selected resource in its current state; recognized LVGL I8 BIN resources can also be converted and extracted as PNG.
-- Replaces a selected resource with a PNG converted against its original BIN template, or with arbitrary file bytes.
+- Previews files recognized as LVGL images (v9 I8/A8/ARGB8888/I4/A4 uncompressed or RLE, v8 RGB565/I8), PNG, and JPEG.
+- Extracts the selected resource in its current state; recognized image resources can also be converted and extracted as PNG.
+- Replaces a selected resource with a PNG converted against its original BIN template (with bidirectional conversion across supported formats), or with arbitrary file bytes.
 - Exports only replaced files plus a root `canora.json` manifest as a `.crpack` ZIP.
 
 PNG conversion keeps the original dimensions and stride. PNGs with more than 256 RGBA colors require opting into lossy quantization. Unsupported BIN formats remain extractable and replaceable as ordinary files, but are not previewed or converted. When a resource has a pending replacement, extraction uses that current replacement; otherwise it extracts the firmware original.

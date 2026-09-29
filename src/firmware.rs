@@ -332,12 +332,9 @@ impl FirmwareSource {
                     let source = resource
                         .get(file.offset..end)
                         .ok_or_else(|| "selected resource range is outside ROMFS".to_string())?;
-                    let (_, png) = lvgl::decode_i8_thumbnail_reader(
-                        Cursor::new(source),
-                        file.size,
-                        max_dimension,
-                    )?;
-                    thumbnails.insert(file.path.clone(), png);
+                    if let Ok((_, png)) = lvgl::decode_thumbnail_png(source, max_dimension) {
+                        thumbnails.insert(file.path.clone(), png);
+                    }
                 }
             }
             Self::Archive {
@@ -352,12 +349,11 @@ impl FirmwareSource {
                 let mut reader = ForwardReader::new(&mut entry);
                 for file in files {
                     reader.advance_to(file.offset as u64)?;
-                    let (_, png) = lvgl::decode_i8_thumbnail_reader(
-                        &mut reader,
-                        file.size,
-                        max_dimension,
-                    )?;
-                    thumbnails.insert(file.path.clone(), png);
+                    let mut data = vec![0u8; file.size];
+                    reader.read_exact(&mut data)?;
+                    if let Ok((_, png)) = lvgl::decode_thumbnail_png(&data, max_dimension) {
+                        thumbnails.insert(file.path.clone(), png);
+                    }
                 }
             }
         }
@@ -548,9 +544,10 @@ fn index_romfs<R: Read>(
                 let file = files
                     .get_mut(file_index)
                     .ok_or_else(|| "ROMFS image index is invalid".to_string())?;
-                let mut image_header = [0u8; 12];
-                reader.read_exact(&mut image_header)?;
-                file.image = lvgl::inspect_i8_header(&image_header, file.size);
+                let header_len = file.size.min(24);
+                let mut image_header = [0u8; 24];
+                reader.read_exact(&mut image_header[..header_len])?;
+                file.image = lvgl::inspect_image_header(&image_header[..header_len], file.size);
             }
             RomfsEvent::Entry { parent } => {
                 let offset = usize::try_from(offset)
@@ -646,7 +643,7 @@ fn index_romfs<R: Read>(
                             offset: usize::try_from(content_offset)
                                 .map_err(|_| "ROMFS file offset is too large".to_string())?,
                         });
-                        if size >= 12 {
+                        if size >= 4 {
                             pending.push(Reverse((
                                 content_offset,
                                 RomfsEvent::ImageHeader { file_index },
@@ -812,20 +809,49 @@ mod tests {
             .filter(|file| file.image.is_some())
             .count();
         eprintln!(
-            "Indexed {} firmware files and {} LVGL I8 images",
+            "Indexed {} firmware files and {} images",
             index.file_count(),
             images
         );
-        let confirm = index
-            .file_bytes("app/common/icon/confirm.bin")
-            .expect("read sample confirm image")
-            .expect("fixture contains the sample confirm image");
-        let (info, png) =
-            lvgl::decode_i8_png(confirm.as_slice()).expect("decode real LVGL I8 image");
-        assert_eq!((info.width, info.height), (48, 48));
-        let restored = lvgl::encode_png_i8(&png, confirm.as_slice(), false)
-            .expect("re-encode the original PNG losslessly");
-        assert_eq!(restored.as_slice(), confirm.as_slice());
+        assert_eq!(images, 4115);
+
+        // Test bidirectional conversion on real samples from each format family!
+        let samples = [
+            ("app/common/icon/confirm.bin", "LVGL9 I8"),
+            ("app/watchface/rect_edit_box.bin", "LVGL9 I8 RLE"),
+            ("app/sports/setting/reminder_hrzone.bin", "LVGL9 A8"),
+            ("app/wxpay/widge_dark21_indexed_8.bin", "LVGL9 ARGB8888"),
+            ("app/wxpay/wxlogo.bin", "LVGL9 I4"),
+            ("app/sports/icon/anim/9/19.bin", "LVGL9 A4 RLE"),
+            ("app/find_phone/phone.bin", "LVGL9 A4"),
+            ("system/startup/miui.bin", "LVGL8 RGB565"),
+            ("app/sleep/sleep_big_remind.bin", "LVGL8 I8"),
+            ("app/stress/measure/Measuring9.jpg", "JPEG"),
+            ("app/easter_egg/spaceship.png", "PNG"),
+        ];
+
+        for (path, label) in samples {
+            let file_bytes = index
+                .file_bytes(path)
+                .expect("read sample file")
+                .unwrap_or_else(|| panic!("fixture contains {}", path));
+            let (info, png) =
+                lvgl::decode_image_png(file_bytes.as_slice()).unwrap_or_else(|e| panic!("decode {} failed: {}", label, e));
+            assert!(info.width > 0 && info.height > 0);
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+            // Re-encode to target format
+            let encoded = lvgl::encode_png_to_template(&png, file_bytes.as_slice(), true)
+                .unwrap_or_else(|e| panic!("re-encode {} failed: {}", label, e));
+            assert!(!encoded.is_empty());
+
+            // Decode re-encoded to verify consistency
+            let (info2, png2) = lvgl::decode_image_png(&encoded)
+                .unwrap_or_else(|e| panic!("re-decode {} failed: {}", label, e));
+            assert_eq!(info.width, info2.width);
+            assert_eq!(info.height, info2.height);
+            assert!(png2.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 
     #[test]
