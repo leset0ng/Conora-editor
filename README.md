@@ -11,7 +11,7 @@ AstroBox NG API Level 4 Rust/WASM plugin for creating Canopus Resource Pack (`.c
 - Replaces a selected resource with a PNG converted against its original BIN template (with bidirectional conversion across supported formats), or with arbitrary file bytes.
 - Exports only replaced files plus a root `canora.json` manifest as a `.crpack` ZIP.
 
-PNG conversion keeps the original dimensions and stride. PNGs with more than 256 RGBA colors require opting into lossy quantization. Unsupported BIN formats remain extractable and replaceable as ordinary files, but are not previewed or converted. When a resource has a pending replacement, extraction uses that current replacement; otherwise it extracts the firmware original.
+PNG conversion keeps the original dimensions and stride. Inputs with the same aspect ratio are automatically scaled up or down to the original dimensions using nearest-neighbor sampling, preserving palette colors and transparent pixels; different aspect ratios are rejected without padding, cropping, or stretching. Same-size inputs are not resampled. PNG inputs are limited to 64 MiB and 16 * 1024 * 1024 pixels. PNGs with more than 256 RGBA colors require opting into lossy quantization. Unsupported BIN formats remain extractable and replaceable as ordinary files, but are not previewed or converted. When a resource has a pending replacement, extraction uses that current replacement; otherwise it extracts the firmware original.
 
 CRPack export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md`. It validates safe paths, `themeId`, mapping count and generated `mappings.tsv` size, manifest size, file count and the 64 MiB uncompressed package limit. It does not install a pack or send it to the watch.
 
