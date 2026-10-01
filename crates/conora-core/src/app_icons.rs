@@ -21,6 +21,8 @@ pub struct AppIconAsset {
     pub template: Option<PathBuf>,
     #[serde(default)]
     pub allow_quantize: bool,
+    #[serde(default, skip_serializing_if = "crate::lvgl::ResizeFilter::is_default")]
+    pub filter: crate::lvgl::ResizeFilter,
 }
 
 /// Packages are opaque, exact identifiers, not filesystem paths.
@@ -73,12 +75,13 @@ pub fn inspect_bin(bytes: &[u8]) -> Result<lvgl::ImageInfo, String> {
     Ok(info)
 }
 
-pub fn encode_detailed(
+pub fn encode_detailed_with_filter(
     input: &[u8],
     template: Option<&[u8]>,
     canopus: bool,
     raw: bool,
     allow_quantize: bool,
+    filter: crate::lvgl::ResizeFilter,
 ) -> Result<lvgl::EncodedImage, String> {
     if raw {
         inspect_bin(input)?;
@@ -97,7 +100,24 @@ pub fn encode_detailed(
         None => return Err("PNG QuickApp icons require an original BIN template".into()),
     };
     inspect_bin(template)?;
-    lvgl::encode_png_to_template_detailed(input, template, allow_quantize)
+    lvgl::encode_png_to_template_with_filter(input, template, allow_quantize, filter)
+}
+
+pub fn encode_detailed(
+    input: &[u8],
+    template: Option<&[u8]>,
+    canopus: bool,
+    raw: bool,
+    allow_quantize: bool,
+) -> Result<lvgl::EncodedImage, String> {
+    encode_detailed_with_filter(
+        input,
+        template,
+        canopus,
+        raw,
+        allow_quantize,
+        crate::lvgl::ResizeFilter::default(),
+    )
 }
 
 pub fn encode(
@@ -108,6 +128,18 @@ pub fn encode(
     allow_quantize: bool,
 ) -> Result<Vec<u8>, String> {
     encode_detailed(input, template, canopus, raw, allow_quantize).map(|image| image.bytes)
+}
+
+pub fn encode_with_filter(
+    input: &[u8],
+    template: Option<&[u8]>,
+    canopus: bool,
+    raw: bool,
+    allow_quantize: bool,
+    filter: crate::lvgl::ResizeFilter,
+) -> Result<Vec<u8>, String> {
+    encode_detailed_with_filter(input, template, canopus, raw, allow_quantize, filter)
+        .map(|image| image.bytes)
 }
 
 #[cfg(test)]

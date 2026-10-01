@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, RgbaImage};
+use serde::{Deserialize, Serialize};
 
 const HEADER_BYTES_V9: usize = 12;
 const COMP_HEADER_BYTES_V9: usize = 12;
@@ -11,6 +12,71 @@ const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_THUMBNAIL_DIMENSION: u32 = 64;
 const MAX_PNG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_UNIQUE_COLORS: usize = 1_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResizeFilter {
+    #[default]
+    Lanczos3,
+    Nearest,
+    Triangle,
+    CatmullRom,
+    Gaussian,
+}
+
+impl ResizeFilter {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Lanczos3)
+    }
+
+    pub fn to_image_filter(self) -> image::imageops::FilterType {
+        match self {
+            Self::Lanczos3 => image::imageops::FilterType::Lanczos3,
+            Self::Nearest => image::imageops::FilterType::Nearest,
+            Self::Triangle => image::imageops::FilterType::Triangle,
+            Self::CatmullRom => image::imageops::FilterType::CatmullRom,
+            Self::Gaussian => image::imageops::FilterType::Gaussian,
+        }
+    }
+
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "lanczos3" | "lanczos" | "smooth" => Some(Self::Lanczos3),
+            "nearest" | "pixel" => Some(Self::Nearest),
+            "triangle" | "bilinear" => Some(Self::Triangle),
+            "catmullrom" | "catmull-rom" | "bicubic" => Some(Self::CatmullRom),
+            "gaussian" => Some(Self::Gaussian),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lanczos3 => "lanczos3",
+            Self::Nearest => "nearest",
+            Self::Triangle => "triangle",
+            Self::CatmullRom => "catmull-rom",
+            Self::Gaussian => "gaussian",
+        }
+    }
+}
+
+impl std::fmt::Display for ResizeFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for ResizeFilter {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(s).ok_or_else(|| {
+            format!("unknown resize filter '{s}'; expected 'lanczos3', 'nearest', 'triangle', 'catmull-rom', or 'gaussian'")
+        })
+    }
+}
+
 
 type Rgba = [u8; 4];
 
@@ -631,7 +697,7 @@ pub fn decode_thumbnail_png(
             &img,
             target_width,
             target_height,
-            image::imageops::FilterType::Nearest,
+            image::imageops::FilterType::Lanczos3,
         )
     };
 
@@ -673,6 +739,20 @@ pub fn encode_png_to_template_detailed(
     png_bytes: &[u8],
     template: &[u8],
     allow_quantize: bool,
+) -> Result<EncodedImage, String> {
+    encode_png_to_template_with_filter(
+        png_bytes,
+        template,
+        allow_quantize,
+        ResizeFilter::default(),
+    )
+}
+
+pub fn encode_png_to_template_with_filter(
+    png_bytes: &[u8],
+    template: &[u8],
+    allow_quantize: bool,
+    filter: ResizeFilter,
 ) -> Result<EncodedImage, String> {
     if png_bytes.len() > MAX_PNG_BYTES {
         return Err("PNG input exceeds the 64 MiB conversion limit".into());
@@ -718,8 +798,7 @@ pub fn encode_png_to_template_detailed(
         .to_rgba8();
     let resized = (source_width, source_height) != (width, height);
     let image = if resized {
-        // Nearest-neighbor sampling preserves palette colors and transparent pixels.
-        image::imageops::resize(&image, width, height, image::imageops::FilterType::Nearest)
+        image::imageops::resize(&image, width, height, filter.to_image_filter())
     } else {
         image
     };
@@ -1263,7 +1342,7 @@ mod tests {
         let png = png_bytes(RgbaImage::from_fn(4, 4, |x, y| {
             colors[(y / 2 * 2 + x / 2) as usize]
         }));
-        let encoded = encode_png_to_template_detailed(&png, &template, false).unwrap();
+        let encoded = encode_png_to_template_with_filter(&png, &template, false, ResizeFilter::Nearest).unwrap();
         assert!(!encoded.lossy_quantization);
         assert_eq!(
             &encoded.bytes[..HEADER_BYTES_V9],
@@ -1277,6 +1356,20 @@ mod tests {
         let (_, decoded) = decode_to_rgba(&encoded.bytes).unwrap();
         assert_eq!(decoded.dimensions(), (2, 2));
         assert_eq!(decoded.pixels().copied().collect::<Vec<_>>(), colors);
+    }
+
+    #[test]
+    fn proportional_downscale_with_default_lanczos3_filter() {
+        let template = sample_template();
+        let pixel = image::Rgba([255, 0, 0, 255]);
+        let png = png_bytes(RgbaImage::from_pixel(4, 4, pixel));
+        let encoded = encode_png_to_template_detailed(&png, &template, false).unwrap();
+        assert_eq!(encoded.bytes[..HEADER_BYTES_V9], template[..HEADER_BYTES_V9]);
+        assert_eq!(encoded.bytes.len(), template.len());
+        assert!(!encoded.lossy_quantization);
+        let (_, decoded) = decode_to_rgba(&encoded.bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0), &pixel);
     }
 
     #[test]

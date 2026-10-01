@@ -458,11 +458,11 @@ fn verify_image(
         &source,
         actual.width(),
         actual.height(),
-        imageops::FilterType::Nearest,
+        summary.filter.to_image_filter(),
     );
     let same_pixels = actual == expected;
     if !same_pixels && !summary.lossy {
-        return Err("built pixels differ from nearest-resized source".into());
+        return Err("built pixels differ from resized source".into());
     }
     Ok(json!({"status":"verified", "sameMetadata":same_metadata,
         "sameHeader":same_header, "samePixels":same_pixels, "lossy":summary.lossy}))

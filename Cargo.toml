@@ -10,7 +10,7 @@ default-members = ["crates/conora-core", "crates/conora-cli"]
 resolver = "3"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 astrobox-ng-wit = "0.4"

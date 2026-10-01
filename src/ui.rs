@@ -80,6 +80,7 @@ struct UiState {
     description: String,
     target: String,
     allow_quantize: bool,
+    resize_filter: lvgl::ResizeFilter,
     busy: bool,
     status: String,
     error: Option<String>,
@@ -113,6 +114,7 @@ impl Default for UiState {
             description: String::new(),
             target: String::new(),
             allow_quantize: false,
+            resize_filter: lvgl::ResizeFilter::default(),
             busy: false,
             status: "选择固件浏览资源，或直接编辑第三方应用图标。".into(),
             error: None,
@@ -155,6 +157,7 @@ struct UiSnapshot {
     description: String,
     target: String,
     allow_quantize: bool,
+    resize_filter: lvgl::ResizeFilter,
     busy: bool,
     status: String,
     error: Option<String>,
@@ -402,6 +405,7 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
         description: state.description.clone(),
         target: state.target.clone(),
         allow_quantize: state.allow_quantize,
+        resize_filter: state.resize_filter,
         busy: state.busy,
         status: state.status.clone(),
         error: state.error.clone(),
@@ -519,6 +523,24 @@ async fn process_click(event_id: &str) {
         "replace.png" => begin_png_pick().await,
         "replace.binary" => begin_binary_pick().await,
         "replace.restore" => restore_selected(),
+        "resize.filter:lanczos3" => {
+            {
+                let mut state = lock_state();
+                state.resize_filter = lvgl::ResizeFilter::Lanczos3;
+                state.status = "已将缩放采样算法切换为 Lanczos3（平滑抗锯齿）。".into();
+                state.error = None;
+            }
+            render_current();
+        }
+        "resize.filter:nearest" => {
+            {
+                let mut state = lock_state();
+                state.resize_filter = lvgl::ResizeFilter::Nearest;
+                state.status = "已将缩放采样算法切换为 Nearest（最近邻/像素风）。".into();
+                state.error = None;
+            }
+            render_current();
+        }
         _ if event_id.starts_with("browser.open:") => {
             let path = &event_id["browser.open:".len()..];
             {
@@ -597,6 +619,14 @@ fn process_change(event_id: &str, payload: &str) {
             }
             "pack.quantize" => {
                 state.allow_quantize = checked;
+                true
+            }
+            "pack.smooth_resize" => {
+                state.resize_filter = if checked {
+                    lvgl::ResizeFilter::Lanczos3
+                } else {
+                    lvgl::ResizeFilter::Nearest
+                };
                 true
             }
             _ => return,
@@ -1289,7 +1319,7 @@ fn set_resource_replacement(state: &mut UiState, path: &str, bytes: Vec<u8>) {
 }
 
 async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
-    let (template, allow_quantize) = {
+    let (template, allow_quantize, resize_filter) = {
         let mut state = lock_state();
         if state.busy {
             return;
@@ -1325,7 +1355,7 @@ async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
             IconPick::Template => "等待选择原始 LVGL BIN 模板（仅用于转换，不导出）…",
         }
         .into();
-        (template, state.allow_quantize)
+        (template, state.allow_quantize, state.resize_filter)
     };
     render_current();
     let picked = psys_host::dialog::pick_file(
@@ -1360,12 +1390,13 @@ async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
                         app_icons::inspect_bin(&picked.data)?;
                         Ok(picked.data)
                     } else {
-                        app_icons::encode(
+                        app_icons::encode_with_filter(
                             &picked.data,
                             template.as_ref().map(|bytes| bytes.as_slice()),
                             package.is_none(),
                             matches!(mode, IconPick::Binary),
                             allow_quantize,
+                            resize_filter,
                         )
                     }
                 })
@@ -1419,7 +1450,7 @@ async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
 }
 
 async fn begin_png_pick() {
-    let (path, template, allow_quantize) = {
+    let (path, template, allow_quantize, resize_filter) = {
         let mut state = lock_state();
         if state.busy {
             return;
@@ -1458,7 +1489,7 @@ async fn begin_png_pick() {
         state.busy = true;
         state.status = "等待选择 PNG 图片…".into();
         state.error = None;
-        (path, template, state.allow_quantize)
+        (path, template, state.allow_quantize, state.resize_filter)
     };
     render_current();
 
@@ -1493,10 +1524,11 @@ async fn begin_png_pick() {
         let format_name = lvgl::inspect_image(template.as_slice())
             .map(|info| info.format.display_name())
             .unwrap_or("目标格式");
-        let result = lvgl::encode_png_to_template_detailed(
+        let result = lvgl::encode_png_to_template_with_filter(
             &picked.data,
             template.as_slice(),
             allow_quantize,
+            resize_filter,
         );
         match result {
             Ok(encoded) => {
@@ -2233,6 +2265,25 @@ fn build_app_icons(state: &UiSnapshot) -> ui::Element {
             .flex_grow(1.0),
         )
         .child(button("添加", "icons.quickapp.add", "soft", "accent").disabled_if(state.busy));
+    let smooth_resize = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .align_center()
+        .gap(8)
+        .child(
+            ui::Element::new(ui::ElementType::Checkbox, None)
+                .prop(
+                    "checked",
+                    if state.resize_filter == lvgl::ResizeFilter::Lanczos3 {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .prop("size", "2")
+                .on(ui::Event::Change, "pack.smooth_resize")
+                .disabled_if(state.busy),
+        )
+        .child(text("启用平滑抗锯齿缩放（Lanczos3，未勾选时为像素最近邻）", 13));
     let quantize = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .align_center()
@@ -2260,7 +2311,7 @@ fn build_app_icons(state: &UiSnapshot) -> ui::Element {
         .child(text("注意：Canopus 预设仅适用于已知的 LVGL v9 117×117 ARGB8888 布局，不适用于 v8 或其他布局；其他设备/固件请确认原始格式，并直接使用匹配的 LVGL BIN。", 12))
         .child(text("设备支持目前限小米手环 11 的 4.100.139 / 4.100.155，需新版资源替换模块支持。此处仅编辑并导出 CRPack，不会立即操作设备。", 12))
         .child(text("快应用标识原样保留（含空格、斜杠或空值）；加上 @quickapp-icon/ 后最多 255 UTF-8 字节，不能含字节 0–31 或 127。", 12))
-        .child(add).child(quantize).child(icons)
+        .child(add).child(smooth_resize).child(quantize).child(icons)
 }
 
 fn build_icon_card(icon: &IconSnapshot, canopus: bool, busy: bool) -> ui::Element {
@@ -2916,6 +2967,28 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
         content = content.child(image_buttons);
 
         if state.selected_template_image {
+            let smooth_checkbox = ui::Element::new(ui::ElementType::Checkbox, None)
+                .prop(
+                    "checked",
+                    if state.resize_filter == lvgl::ResizeFilter::Lanczos3 {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .prop("size", "2")
+                .on(ui::Event::Change, "pack.smooth_resize")
+                .disabled_if(state.busy);
+            content = content.child(
+                ui::Element::new(ui::ElementType::Div, None)
+                    .flex()
+                    .flex_direction(ui::FlexDirection::Row)
+                    .align_center()
+                    .gap(8)
+                    .child(smooth_checkbox)
+                    .child(text("启用平滑抗锯齿缩放（Lanczos3，未勾选时为像素最近邻）", 13)),
+            );
+
             let checkbox = ui::Element::new(ui::ElementType::Checkbox, None)
                 .prop(
                     "checked",
@@ -3075,6 +3148,27 @@ impl DisabledElement for ui::Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_filter_defaults_to_lanczos3_and_can_toggle() {
+        let mut state = UiState::default();
+        assert_eq!(state.resize_filter, lvgl::ResizeFilter::Lanczos3);
+
+        let snap = snapshot(&mut state);
+        assert_eq!(snap.resize_filter, lvgl::ResizeFilter::Lanczos3);
+
+        state.resize_filter = lvgl::ResizeFilter::Nearest;
+        let snap = snapshot(&mut state);
+        assert_eq!(snap.resize_filter, lvgl::ResizeFilter::Nearest);
+    }
+
+    #[test]
+    fn smooth_resize_checkbox_toggles_filter() {
+        process_change("pack.smooth_resize", r#"{"checked":"false"}"#);
+        assert_eq!(lock_state().resize_filter, lvgl::ResizeFilter::Nearest);
+        process_change("pack.smooth_resize", r#"{"checked":"true"}"#);
+        assert_eq!(lock_state().resize_filter, lvgl::ResizeFilter::Lanczos3);
+    }
 
     #[test]
     fn entered_quickapp_identifiers_are_never_trimmed_or_interpreted_as_paths() {

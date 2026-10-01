@@ -47,6 +47,9 @@ pub(super) struct Set {
     /// Explicitly permit palette quantization during PNG conversion.
     #[arg(long, conflicts_with = "raw")]
     allow_quantize: bool,
+    /// Image downscale / resize sampling filter (lanczos3 [default], nearest, triangle, catmull-rom, gaussian).
+    #[arg(long, conflicts_with = "raw")]
+    filter: Option<conora_core::ResizeFilter>,
 }
 
 #[derive(Args)]
@@ -142,7 +145,13 @@ pub(super) fn run(command: IconCommand) -> Result<Value> {
         IconCommand::Set(args) => mutate(
             &args.theme,
             args.selector,
-            Some((args.input, args.raw, args.template, args.allow_quantize)),
+            Some((
+                args.input,
+                args.raw,
+                args.template,
+                args.allow_quantize,
+                args.filter.unwrap_or_default(),
+            )),
         ),
         IconCommand::Remove(args) => mutate(&args.theme, args.selector, None),
     }
@@ -151,7 +160,7 @@ pub(super) fn run(command: IconCommand) -> Result<Value> {
 fn mutate(
     theme_argument: &Path,
     selector: Selector,
-    set: Option<(PathBuf, bool, Option<PathBuf>, bool)>,
+    set: Option<(PathBuf, bool, Option<PathBuf>, bool, conora_core::ResizeFilter)>,
 ) -> Result<Value> {
     if let Some(package) = &selector.package {
         conora_core::app_icons::validate_package(package)?;
@@ -185,7 +194,7 @@ fn mutate(
     };
     let package = selector.package.as_deref();
     let mut published = Vec::new();
-    let asset = if let Some((input, raw, template_path, allow_quantize)) = set {
+    let asset = if let Some((input, raw, template_path, allow_quantize, filter)) = set {
         super::path_text(&input)?;
         if let Some(path) = &template_path {
             super::path_text(path)?;
@@ -203,12 +212,13 @@ fn mutate(
             .transpose()?;
         // Validate the complete conversion before any project mutation. The core
         // encoder bounds image dimensions and rejects malformed native raw BINs.
-        conora_core::app_icons::encode(
+        conora_core::app_icons::encode_with_filter(
             &bytes,
             template.as_deref(),
             selector.canopus,
             raw,
             allow_quantize,
+            filter,
         )?;
         protected.push(input);
         if let Some(path) = template_path {
@@ -228,6 +238,9 @@ fn mutate(
             .map_err(|e| super::io_failure("could not stage icon input", &input_path, e))?;
         let mut asset = json!({"input":super::portable_relative(&input_path, &theme.root)?,
             "mode":if raw {"raw"} else {"png"}, "allowQuantize":allow_quantize});
+        if !filter.is_default() {
+            asset["filter"] = json!(filter.as_str());
+        }
         if let Some(bytes) = template {
             let path = asset_dir.join("template.bin");
             fs::write(&path, bytes)

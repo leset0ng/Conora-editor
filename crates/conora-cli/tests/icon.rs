@@ -621,3 +621,25 @@ fn unsafe_tsv_bytes_and_overbudget_sources_do_not_publish_assets() {
     }
     // NUL cannot be passed to a process; core/archive tests cover that byte.
 }
+
+#[test]
+fn custom_resize_filter_records_in_theme_json() {
+    let dir = fixture();
+    let root = dir.path();
+    run(
+        root,
+        &[
+            "icon",
+            "set",
+            "--canopus",
+            "source.png",
+            "--filter",
+            "nearest",
+            "--theme",
+            "theme",
+        ],
+        0,
+    );
+    let theme = config(root);
+    assert_eq!(theme["canopusIcon"]["filter"], "nearest");
+}

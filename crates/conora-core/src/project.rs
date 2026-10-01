@@ -71,6 +71,8 @@ pub struct AssetOptions {
     pub mode: AssetMode,
     #[serde(default)]
     pub allow_quantize: bool,
+    #[serde(default, skip_serializing_if = "crate::lvgl::ResizeFilter::is_default")]
+    pub filter: crate::lvgl::ResizeFilter,
 }
 
 impl Asset {
@@ -80,6 +82,7 @@ impl Asset {
                 input: input.clone(),
                 mode: AssetMode::Png,
                 allow_quantize: false,
+                filter: crate::lvgl::ResizeFilter::default(),
             },
             Self::Detailed(options) => options.clone(),
         }
@@ -158,6 +161,7 @@ pub struct ResourceSummary {
     pub width: Option<u16>,
     pub height: Option<u16>,
     pub lossy: bool,
+    pub filter: crate::lvgl::ResizeFilter,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -663,10 +667,11 @@ pub fn prepare_target_with_progress(
                 if notified.insert(role.role.clone()) {
                     progress(&format!("Converting role {}", role.role));
                 }
-                match lvgl::encode_png_to_template_detailed(
+                match lvgl::encode_png_to_template_with_filter(
                     role.source.as_ref().expect("validated source"),
                     template,
                     role.options.allow_quantize,
+                    role.options.filter,
                 ) {
                     Ok(encoded) => record_replacement(
                         &mut report,
@@ -852,12 +857,13 @@ fn prepare_app_icon(
         } else {
             None
         };
-        let encoded = app_icons::encode_detailed(
+        let encoded = app_icons::encode_detailed_with_filter(
             &input,
             template.as_deref(),
             package.is_none(),
             asset.mode == AssetMode::Raw,
             asset.allow_quantize,
+            asset.filter,
         )?;
         if encoded.bytes.len() > MAX_PACK_BYTES.saturating_sub(*total_bytes) {
             return Err("replacement files exceed the 64 MiB CRPack limit".into());
@@ -904,6 +910,7 @@ fn prepare_app_icon(
         width: Some(info.width),
         height: Some(info.height),
         lossy: encoded.lossy_quantization,
+        filter: asset.filter,
     });
     *total_bytes += encoded.bytes.len();
     replacements.insert(destination.clone(), encoded.bytes);
@@ -970,6 +977,7 @@ fn record_replacement(
         width: file.image.map(|info| info.width),
         height: file.image.map(|info| info.height),
         lossy,
+        filter: work.options.filter,
     });
     replacements.insert(file.path.clone(), bytes);
 }
