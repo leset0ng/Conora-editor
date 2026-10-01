@@ -33,7 +33,7 @@ conora check --theme my-icons --all-targets --json
 conora build --theme my-icons --all-targets --output ./packs
 ```
 
-After the core and CLI crates are published to crates.io, installation will also be available with `cargo install conora-cli --locked`. They are not published by this repository change.
+After the core and CLI crates are published to crates.io, installation will also be available with `cargo install conora --locked`. They are not published by this repository change.
 
 Existing packs can be imported with `conora import pack.crpack --into ./theme --firmware firmware.bin --target p67-3.101.043`. `conora plan --theme ./theme --from p67-3.101.043 --target q66-4.100.155` proposes bindings without changing them; `conora preview --theme ./theme --target q66-4.100.155 --verify` previews actual encoded resources and verifies conversion. Explicit target exclusions let one firmware retain icons another firmware cannot use. Native batch operations traverse compressed resources once instead of restarting decompression for every icon.
 

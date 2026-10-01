@@ -11,13 +11,13 @@ cargo install --path crates/conora-cli --locked
 conora --help
 ```
 
-After `conora-core` and `conora-cli` are published to crates.io:
+After `conora-core` and `conora` are published to crates.io:
 
 ```bash
-cargo install conora-cli --locked
+cargo install conora --locked
 ```
 
-The installed executable is `conora`, not `conora-cli`. These crates are prepared for publication but are not published by this change. Rust 1.88 or newer is required. The existing AstroBox plugin remains a separate WASM build.
+The installed executable is `conora`. These crates are prepared for publication but are not published by this change. Rust 1.88 or newer is required. The existing AstroBox plugin remains a separate WASM build.
 
 ## One theme, multiple firmwares
 
