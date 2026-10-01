@@ -417,3 +417,346 @@ fn rejects_unknown_config_fields_versions_and_unsafe_target_names() {
     );
     assert!(load_theme(directory.path()).is_err());
 }
+
+#[test]
+fn explicit_exclusions_are_reported_without_reading_their_assets() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x0a), 1);
+    write_json(
+        &directory.path().join("theme.json"),
+        &json!({
+            "themeId": "dark", "name": "Dark",
+            "icons": {"confirm": "assets/icon.png", "optional": "missing.png"}
+        }),
+    );
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["excluded"] = json!({"optional": "Not present on this firmware"});
+    write_json(&path, &config);
+    let theme = load_theme(directory.path()).unwrap();
+    let built = prepare_target(&theme, "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    assert_eq!(built.report.resources.len(), 1);
+    assert_eq!(
+        built.report.excluded["optional"],
+        "Not present on this firmware"
+    );
+    assert_eq!(
+        serde_json::to_value(&built.report).unwrap()["excluded"],
+        config["excluded"]
+    );
+
+    config.as_object_mut().unwrap().remove("excluded");
+    write_json(&path, &config);
+    let built = prepare_target(&theme, "A");
+    assert!(
+        built
+            .report
+            .errors
+            .iter()
+            .any(|error| error.code == "missing_binding")
+    );
+    let loaded = conora_core::project::load_target(&theme, "A").unwrap();
+    assert!(loaded.excluded.is_empty());
+    assert!(
+        serde_json::to_value(loaded)
+            .unwrap()
+            .get("excluded")
+            .is_none()
+    );
+}
+
+#[test]
+fn invalid_exclusions_and_conflicts_are_independent_errors() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x0a), 1);
+    let path = directory.path().join("targets/A.json");
+    let original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let theme = load_theme(directory.path()).unwrap();
+    for reason in [
+        "".to_string(),
+        "   ".into(),
+        "reason\n".into(),
+        "x".repeat(1025),
+    ] {
+        let mut config = original.clone();
+        config["excluded"] = json!({"confirm": reason, "unknown": "Not supported"});
+        write_json(&path, &config);
+        let built = prepare_target(&theme, "A");
+        for code in ["exclusion_reason", "excluded_conflict", "unknown_role"] {
+            assert!(
+                built.report.errors.iter().any(|error| error.code == code),
+                "{code}: {:?}",
+                built.report.errors
+            );
+        }
+        assert!(built.pack.is_none());
+        assert!(
+            !built
+                .report
+                .errors
+                .iter()
+                .any(|error| error.code == "missing_binding")
+        );
+    }
+    let mut config = original;
+    config["bindings"] = json!({});
+    config["overrides"] = json!({"confirm": "assets/icon.png"});
+    config["excluded"] = json!({"confirm": "No firmware equivalent"});
+    write_json(&path, &config);
+    assert!(
+        prepare_target(&theme, "A")
+            .report
+            .errors
+            .iter()
+            .any(|error| error.code == "excluded_conflict")
+    );
+}
+
+#[test]
+fn dotted_firmware_version_target_ids_are_safe_and_discoverable() {
+    use conora_core::project::validate_target_id;
+    for id in ["p67-3.101.043", "A.B", "a."] {
+        assert!(validate_target_id(id).is_ok());
+    }
+    for id in [
+        "",
+        ".",
+        "..",
+        ".hidden",
+        "../A",
+        "a/../b",
+        "a\\b",
+        "/absolute",
+        "non ascii é",
+    ] {
+        assert!(validate_target_id(id).is_err(), "{id}");
+    }
+    assert!(validate_target_id(&"a".repeat(64)).is_ok());
+    assert!(validate_target_id(&"a".repeat(65)).is_err());
+    let directory = project();
+    target(
+        directory.path(),
+        "p67-3.101.043",
+        "icons",
+        &template(2, 2, 0x0a),
+        1,
+    );
+    let theme = load_theme(directory.path()).unwrap();
+    assert_eq!(target_ids(&theme).unwrap(), ["p67-3.101.043"]);
+    assert!(prepare_target(&theme, "p67-3.101.043").report.valid);
+}
+
+fn batch_indexes() -> Vec<conora_core::firmware::FirmwareIndex> {
+    use conora_core::firmware::FirmwareIndex;
+    let data = romfs("icons", b"test", 2);
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "vela_resource.bin",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+    writer.write_all(&data).unwrap();
+    vec![
+        FirmwareIndex::from_romfs(data).unwrap(),
+        FirmwareIndex::from_firmware(writer.finish().unwrap().into_inner()).unwrap(),
+    ]
+}
+
+#[test]
+fn batch_resources_are_deduplicated_and_visited_in_physical_order() {
+    for index in batch_indexes() {
+        let paths = vec![
+            "app/icons/copy.bin".into(),
+            "app/icons/test.bin".into(),
+            "app/icons/copy.bin".into(),
+        ];
+        let mut visited = Vec::new();
+        index
+            .visit_file_bytes(&paths, 4, 8, |path, bytes| {
+                visited.push(path.to_owned());
+                assert_eq!(bytes, b"test");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, ["app/icons/test.bin", "app/icons/copy.bin"]);
+        // Visiting does not break the independent lazy browser API.
+        assert_eq!(
+            index
+                .file_bytes("app/icons/copy.bin")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"test"
+        );
+    }
+}
+
+#[test]
+fn batch_preflights_all_paths_and_budgets_before_any_callback() {
+    for index in batch_indexes() {
+        let paths = vec!["app/icons/test.bin".into(), "app/icons/copy.bin".into()];
+        let mut calls = 0;
+        let mut callback = |_: &str, _: &[u8]| {
+            calls += 1;
+            Ok(())
+        };
+        assert!(
+            index
+                .visit_file_bytes(&paths, 3, 8, &mut callback)
+                .unwrap_err()
+                .contains("per-file limit")
+        );
+        assert!(
+            index
+                .visit_file_bytes(&paths, 4, 7, &mut callback)
+                .unwrap_err()
+                .contains("aggregate limit")
+        );
+        let missing = vec![paths[0].clone(), "missing.bin".into(), "another.bin".into()];
+        let error = index
+            .visit_file_bytes(&missing, 3, 3, &mut callback)
+            .unwrap_err();
+        for text in [
+            "missing.bin",
+            "another.bin",
+            "per-file limit",
+            "aggregate limit",
+        ] {
+            assert!(error.contains(text), "{error}");
+        }
+        assert_eq!(calls, 0);
+        index
+            .visit_file_bytes(&[], 0, 0, |_, _| panic!("empty request"))
+            .unwrap();
+    }
+}
+
+#[test]
+fn batch_callback_error_stops_before_the_next_resource() {
+    for index in batch_indexes() {
+        let paths = vec!["app/icons/copy.bin".into(), "app/icons/test.bin".into()];
+        let mut calls = 0;
+        let error = index
+            .visit_file_bytes(&paths, 4, 8, |_, _| {
+                calls += 1;
+                Err("callback stopped".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "callback stopped");
+        assert_eq!(calls, 1);
+    }
+}
+
+#[test]
+fn preparation_progress_reports_loading_and_conversion_without_rereading_assets() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x0a), 2);
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["bindings"]["confirm"] = json!(["app/icons/copy.bin", "app/icons/test.bin"]);
+    write_json(&path, &config);
+    let theme = load_theme(directory.path()).unwrap();
+    let mut events = Vec::new();
+    let built = conora_core::project::prepare_target_with_progress(&theme, "A", |event| {
+        events.push(event.to_owned());
+        if event == "Converting role confirm" {
+            fs::remove_file(directory.path().join("assets/icon.png")).unwrap();
+        }
+    });
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    assert_eq!(built.report.resources.len(), 2);
+    assert_eq!(
+        events,
+        [
+            "Loading firmware for target A",
+            "Loading asset for role confirm",
+            "Converting role confirm"
+        ]
+    );
+}
+
+#[test]
+fn aggregate_template_limit_rejects_conversion_before_materializing_any_template() {
+    let directory = project();
+    let mut original = template(2, 2, 0x0a);
+    original.resize(conora_core::project::MAX_TEMPLATE_BYTES / 2 + 1, 0);
+    let data = romfs("icons", &original, 2);
+    drop(original);
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "vela_resource.bin",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+    writer.write_all(&data).unwrap();
+    drop(data);
+    let firmware_path = directory.path().join("aggregate.bin");
+    fs::write(&firmware_path, writer.finish().unwrap().into_inner()).unwrap();
+    let firmware = load_firmware(&firmware_path, None).unwrap();
+    write_json(
+        &directory.path().join("targets/aggregate.json"),
+        &json!({
+            "firmware": "../aggregate.bin", "firmwareSha256": firmware.sha256,
+            "bindings": {"confirm": ["app/icons/copy.bin", "app/icons/test.bin"]}
+        }),
+    );
+    let mut conversion_started = false;
+    let built = conora_core::project::prepare_target_with_progress(
+        &load_theme(directory.path()).unwrap(),
+        "aggregate",
+        |event| {
+            conversion_started |= event.starts_with("Converting");
+        },
+    );
+    assert!(!conversion_started);
+    assert!(built.report.resources.is_empty());
+    assert!(
+        built
+            .report
+            .errors
+            .iter()
+            .any(|error| error.code == "template_size" && error.message.contains("aggregate"))
+    );
+    assert!(built.pack.is_none());
+}
+
+#[test]
+fn aggregate_source_assets_are_bounded_even_when_each_file_is_within_its_limit() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x0a), 2);
+    for name in ["first.bin", "second.bin"] {
+        fs::File::create(directory.path().join("assets").join(name))
+            .unwrap()
+            .set_len((conora_core::project::MAX_TEMPLATE_BYTES / 2 + 1) as u64)
+            .unwrap();
+    }
+    write_json(
+        &directory.path().join("theme.json"),
+        &json!({
+            "themeId": "dark", "name": "Dark",
+            "icons": {
+                "confirm": {"input": "assets/first.bin", "mode": "raw"},
+                "second": {"input": "assets/second.bin", "mode": "raw"}
+            }
+        }),
+    );
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["bindings"]["second"] = json!("app/icons/copy.bin");
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(
+        built
+            .report
+            .errors
+            .iter()
+            .any(|error| error.code == "asset_input" && error.role.as_deref() == Some("second"))
+    );
+    assert_eq!(built.report.resources.len(), 1);
+    assert!(built.pack.is_none());
+}

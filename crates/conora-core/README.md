@@ -25,7 +25,13 @@ if let Some(pack) = prepared.pack {
 
 The theme schema separates logical icon roles from target-specific firmware paths. Assets are resolved relative to `theme.json`; firmware paths are resolved relative to the target config in `targets/`. A target records only the SHA-256 of the entire input firmware, not hashes of individual resources or assets. A different firmware must be explicitly pinned and its bindings reviewed.
 
-Native project firmware reads are limited to 512 MiB, config files to 1 MiB, and assets/original conversion templates to 64 MiB. Special-file inputs are rejected; Unix reads avoid blocking on FIFOs.
+Targets can explicitly exclude a shared role with a nonblank reason in `excluded`; exclusions are reported and cannot coexist with bindings/overrides. All other roles remain required. Dotted firmware-version target IDs such as `p67-3.101.043` are accepted without permitting hidden paths or traversal.
+
+Native project firmware reads are limited to 512 MiB, config files to 1 MiB, and assets/original conversion templates to 64 MiB per file and in aggregate per prepared target. Special-file inputs are rejected; Unix reads avoid blocking on FIFOs.
+
+`FirmwareIndex::visit_file_bytes` preflights all requested paths and byte budgets, deduplicates and visits them in physical order through a single compressed stream, releasing each buffer after its callback. Project preparation uses this batch path while individual browser reads remain lazy. `prepare_target_with_progress` exposes callback progress without writing to stderr from the shared core.
+
+Raster decoding is capped at 16 megapixels before allocation. RLE expansion must cover the indexed dimensions, fit the 64 MiB payload budget and complete the declared expansion; bounded vendor padding is allowed.
 
 PNG inputs are proportionally resized to each original template with nearest-neighbor sampling. Different aspect ratios are rejected; use a target asset override rather than implicit cropping. Palette quantization needs explicit opt-in. Native color precision reduction (RGB565, alpha-only formats) and JPEG encoding can be intrinsically lossy and are reported separately. Raw replacements are copied without certifying device compatibility.
 

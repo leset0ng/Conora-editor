@@ -149,6 +149,317 @@ fn project() -> TempDir {
 }
 
 #[test]
+fn planning_is_read_only_and_image_hints_are_advisory() {
+    let root = project();
+    let config = root.path().join("my-icons/targets/B.json");
+    let before = fs::read(&config).unwrap();
+    let report = success(run(
+        root.path(),
+        &[
+            "plan",
+            "--theme",
+            "my-icons",
+            "--from",
+            "A",
+            "--target",
+            "B",
+            "--compare-images",
+            "--json",
+        ],
+    ));
+    assert_eq!(report["readOnly"], true);
+    assert_eq!(report["requiresConfirmation"], true);
+    assert_eq!(
+        report["roles"][0]["candidates"][0]["path"],
+        "app/other/test.bin"
+    );
+    assert_eq!(
+        report["roles"][0]["candidates"][0]["aspectRatioCompatible"],
+        true
+    );
+    assert!(report["roles"][0]["candidates"][0]["artworkSimilarity"].is_number());
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(!root.path().join("my-icons/dist").exists());
+    assert!(!root.path().join("my-icons/plan.json").exists());
+    update_json(&root.path().join("my-icons/theme.json"), |theme| {
+        theme["icons"]["unmatched"] = json!("assets/missing.png");
+    });
+    let report = success(run(
+        root.path(),
+        &[
+            "plan",
+            "--theme",
+            "my-icons",
+            "--from",
+            "A",
+            "--target",
+            "B",
+            "--compare-images",
+            "--json",
+        ],
+    ));
+    assert_eq!(report["unmatched"], json!(["unmatched"]));
+    update_json(&root.path().join("my-icons/theme.json"), |theme| {
+        theme["icons"]["confirm"] = json!("assets/missing.png");
+    });
+    let report = success(run(
+        root.path(),
+        &[
+            "plan",
+            "--theme",
+            "my-icons",
+            "--from",
+            "A",
+            "--target",
+            "B",
+            "--compare-images",
+            "--json",
+        ],
+    ));
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "source_image_unavailable")
+    );
+    assert!(
+        !report["roles"][0]["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn unavailable_candidate_artwork_keeps_the_read_only_lexical_plan() {
+    let root = project();
+    let file = root.path().join("B.bin");
+    let mut bytes = fs::read(&file).unwrap();
+    bytes[129] = 0x0a;
+    bytes[130] = 8;
+    bytes[136..138].copy_from_slice(&4u16.to_le_bytes());
+    bytes[144..148].copy_from_slice(&2u32.to_le_bytes());
+    bytes[148..152].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(&file, bytes).unwrap();
+    success(run(
+        root.path(),
+        &[
+            "target",
+            "add",
+            "B",
+            "--theme",
+            "my-icons",
+            "--firmware",
+            "B.bin",
+            "--force",
+            "--json",
+        ],
+    ));
+    let report = success(run(
+        root.path(),
+        &[
+            "plan",
+            "--theme",
+            "my-icons",
+            "--from",
+            "A",
+            "--target",
+            "B",
+            "--compare-images",
+            "--json",
+        ],
+    ));
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "candidate_image_unavailable")
+    );
+    assert_eq!(
+        report["roles"][0]["candidates"][0]["path"],
+        "app/other/test.bin"
+    );
+    assert!(report["roles"][0]["candidates"][0]["artworkSimilarity"].is_null());
+}
+
+#[test]
+fn cli_reports_explicit_exclusions_without_weakening_missing_binding_errors() {
+    let root = project();
+    update_json(&root.path().join("my-icons/theme.json"), |theme| {
+        theme["icons"]["old_slot"] = json!("assets/not-required.png");
+    });
+    let failed = failure(
+        run(
+            root.path(),
+            &["check", "--theme", "my-icons", "--target", "B", "--json"],
+        ),
+        1,
+    );
+    assert!(
+        failed["targets"][0]["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["code"] == "missing_binding")
+    );
+    update_json(&root.path().join("my-icons/targets/B.json"), |target| {
+        target["excluded"] =
+            json!({"old_slot":"This firmware has no corresponding launcher slot."});
+    });
+    let checked = success(run(
+        root.path(),
+        &["check", "--theme", "my-icons", "--target", "B", "--json"],
+    ));
+    assert_eq!(
+        checked["targets"][0]["excluded"]["old_slot"],
+        "This firmware has no corresponding launcher slot."
+    );
+    assert_eq!(
+        checked["targets"][0]["resources"].as_array().unwrap().len(),
+        1
+    );
+    success(run(
+        root.path(),
+        &[
+            "target",
+            "add",
+            "p67-3.101.043",
+            "--theme",
+            "my-icons",
+            "--firmware",
+            "A.bin",
+            "--json",
+        ],
+    ));
+    assert!(
+        root.path()
+            .join("my-icons/targets/p67-3.101.043.json")
+            .exists()
+    );
+}
+
+#[test]
+fn batch_extraction_preserves_paths_and_publishes_only_after_all_resources_decode() {
+    let root = tempfile::tempdir().unwrap();
+    let image = template(2, 0x0a);
+    let mut bytes = firmware("icons", &image);
+    let next = bytes.len().next_multiple_of(16);
+    bytes.resize(next + 32 + image.len(), 0);
+    let length = bytes.len() as u32;
+    bytes[8..12].copy_from_slice(&length.to_be_bytes());
+    bytes[96..100].copy_from_slice(&((next as u32) | 2).to_be_bytes());
+    bytes[next..next + 4].copy_from_slice(&2u32.to_be_bytes());
+    bytes[next + 8..next + 12].copy_from_slice(&(image.len() as u32).to_be_bytes());
+    bytes[next + 16..next + 25].copy_from_slice(b"test2.bin");
+    bytes[next + 32..].copy_from_slice(&image);
+    fs::write(root.path().join("firmware.bin"), bytes).unwrap();
+    let arguments = [
+        "extract",
+        "--firmware",
+        "firmware.bin",
+        "--resource",
+        "app/icons/test2.bin",
+        "--resource",
+        "app/icons/test.bin",
+        "--as",
+        "png",
+        "--output",
+        "batch",
+        "--json",
+    ];
+    let output = run(root.path(), &arguments);
+    assert!(!output.stderr.is_empty());
+    let extracted = success(output);
+    assert_eq!(extracted["outputs"].as_array().unwrap().len(), 2);
+    assert!(root.path().join("batch/app/icons/test.png").exists());
+    assert!(root.path().join("batch/app/icons/test2.png").exists());
+    let before = fs::read(root.path().join("batch/app/icons/test.png")).unwrap();
+    failure(run(root.path(), &arguments), 1);
+    assert_eq!(
+        fs::read(root.path().join("batch/app/icons/test.png")).unwrap(),
+        before
+    );
+    failure(
+        run(
+            root.path(),
+            &[
+                "extract",
+                "--firmware",
+                "firmware.bin",
+                "--resource",
+                "app/icons/test.bin",
+                "--resource",
+                "app/icons/missing.bin",
+                "--as",
+                "png",
+                "--output",
+                "invalid",
+                "--json",
+            ],
+        ),
+        1,
+    );
+    assert!(!root.path().join("invalid").exists());
+    failure(
+        run(
+            root.path(),
+            &[
+                "extract",
+                "--firmware",
+                "firmware.bin",
+                "--resource",
+                "app/icons/test.bin",
+                "--resource",
+                "app/icons/test.bin",
+                "--output",
+                "duplicates",
+                "--json",
+            ],
+        ),
+        1,
+    );
+    assert!(!root.path().join("duplicates").exists());
+    let page = success(run(
+        root.path(),
+        &["ls", "--firmware", "firmware.bin", "--limit", "1", "--json"],
+    ));
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["resources"].as_array().unwrap().len(), 1);
+    assert_eq!(page["nextOffset"], 1);
+    let page = success(run(
+        root.path(),
+        &[
+            "ls",
+            "--firmware",
+            "firmware.bin",
+            "--offset",
+            "1",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    ));
+    assert_eq!(page["nextOffset"], Value::Null);
+    #[cfg(unix)]
+    {
+        let alias = root.path().join("batch/app/icons/test2.png");
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("test.png", &alias).unwrap();
+        let mut forced = arguments.to_vec();
+        forced.push("--force");
+        let error = failure(run(root.path(), &forced), 1);
+        assert_eq!(error["errors"][0]["code"], "duplicate_output");
+        assert_eq!(
+            fs::read(root.path().join("batch/app/icons/test.png")).unwrap(),
+            before
+        );
+        assert!(fs::symlink_metadata(alias).unwrap().is_symlink());
+    }
+}
+
+#[test]
 fn malformed_unselected_targets_do_not_block_selected_target_workflows() {
     let root = project();
     fs::write(root.path().join("my-icons/targets/B.json"), b"{broken").unwrap();

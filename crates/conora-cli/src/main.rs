@@ -9,6 +9,10 @@ use conora_core::{crpack, lvgl, project};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
+mod adapt;
+mod import_pack;
+mod preview;
+
 #[derive(Parser)]
 #[command(
     name = "conora",
@@ -42,6 +46,12 @@ enum Command {
     Build(Build),
     /// Strictly inspect a CRPack archive.
     Inspect { pack: PathBuf },
+    /// Import an existing CRPack into an editable firmware theme project.
+    Import(import_pack::Import),
+    /// Suggest cross-firmware bindings without editing target configs.
+    Plan(adapt::Plan),
+    /// Preview actual encoded resources and optionally verify them against templates.
+    Preview(preview::Preview),
 }
 
 #[derive(Args)]
@@ -101,6 +111,12 @@ struct List {
     /// Filter resource paths by a case-sensitive substring.
     #[arg(long)]
     search: Option<String>,
+    /// Skip this many matching resources.
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Return at most this many matching resources (default: all).
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -113,8 +129,9 @@ enum ExtractFormat {
 struct Extract {
     #[command(flatten)]
     source: FirmwareSelector,
-    #[arg(long)]
-    resource: String,
+    /// Repeat for batch extraction; --output is a directory when selecting multiple resources.
+    #[arg(long, required = true)]
+    resource: Vec<String>,
     #[arg(long = "as", value_enum, default_value = "raw")]
     format: ExtractFormat,
     #[arg(long)]
@@ -211,6 +228,9 @@ fn main() -> ExitCode {
         Command::Check(_) => "check",
         Command::Build(_) => "build",
         Command::Inspect { .. } => "inspect",
+        Command::Import(_) => "import",
+        Command::Plan(_) => "plan",
+        Command::Preview(_) => "preview",
     };
     match run(cli.command) {
         Ok(mut value) => {
@@ -261,9 +281,15 @@ fn print_human(value: &Value) -> io::Result<()> {
             write!(
                 out,
                 "{}\t{} bytes",
-                resource["path"].as_str().unwrap_or(""),
+                resource["path"]
+                    .as_str()
+                    .or_else(|| resource["resource"].as_str())
+                    .unwrap_or(""),
                 resource["size"]
             )?;
+            if let Some(output) = resource["output"].as_str() {
+                write!(out, "\t-> {output}")?;
+            }
             if resource["image"].is_object() {
                 let image = &resource["image"];
                 write!(
@@ -337,6 +363,9 @@ fn run(command: Command) -> Result<Value> {
         Command::Check(args) => check_build(args, None),
         Command::Build(args) => check_build(args.selection, Some((args.output, args.force))),
         Command::Inspect { pack } => inspect(&pack),
+        Command::Import(args) => import_pack::run(args),
+        Command::Plan(args) => adapt::run(args),
+        Command::Preview(args) => preview::run(args),
     }
 }
 
@@ -515,12 +544,26 @@ fn resolve_firmware(
 
 fn list(args: List) -> Result<Value> {
     let resolved = resolve_firmware(&args.source, false)?;
-    let resources: Vec<Value> = resolved.loaded.index.files().iter()
+    let matching: Vec<_> = resolved
+        .loaded
+        .index
+        .files()
+        .iter()
         .filter(|file| !args.images || file.image.is_some())
-        .filter(|file| args.search.as_ref().is_none_or(|search| file.path.contains(search)))
+        .filter(|file| {
+            args.search
+                .as_ref()
+                .is_none_or(|search| file.path.contains(search))
+        })
+        .collect();
+    let resources: Vec<Value> = matching.iter().skip(args.offset).take(args.limit.unwrap_or(usize::MAX))
         .map(|file| json!({ "path": file.path, "size": file.size, "image": file.image.map(image_json) }))
         .collect();
-    Ok(json!({ "firmwareSha256": resolved.loaded.sha256, "resources": resources }))
+    let next = args.offset.saturating_add(resources.len());
+    Ok(
+        json!({ "firmwareSha256": resolved.loaded.sha256, "resources": resources,
+        "total":matching.len(),"offset":args.offset,"nextOffset":if next < matching.len() && !resources.is_empty(){Some(next)}else{None} }),
+    )
 }
 
 fn image_json(image: lvgl::ImageInfo) -> Value {
@@ -548,42 +591,105 @@ fn validate_extract_resource(
 }
 
 fn extract(args: Extract) -> Result<Value> {
+    use std::collections::{BTreeMap, BTreeSet};
     path_text(&args.output)?;
+    if args.resource.is_empty() {
+        return Err(Failure::new("usage", "at least one --resource is required"));
+    }
     let resolved = resolve_firmware(&args.source, true)?;
-    preflight(&args.output, args.force, &resolved.protected)?;
-    let file = resolved.loaded.index.file(&args.resource).ok_or_else(|| {
-        Failure::new(
-            "resource_not_found",
-            format!("firmware has no resource {}", args.resource),
-        )
-    })?;
-    // Enforce the indexed size before materializing compressed resource bytes.
-    validate_extract_resource(file.size, file.image.is_some(), args.format)?;
-    let bytes = resolved
-        .loaded
-        .index
-        .file_bytes(&args.resource)?
-        .ok_or_else(|| {
+    let multiple = args.resource.len() > 1;
+    let mut destinations = BTreeMap::new();
+    let mut output_paths = BTreeSet::new();
+    for resource in &args.resource {
+        crpack::validate_relative_path(resource)?;
+        let file = resolved.loaded.index.file(resource).ok_or_else(|| {
             Failure::new(
                 "resource_not_found",
-                format!("firmware has no resource {}", args.resource),
+                format!("firmware has no resource {resource}"),
             )
         })?;
-    let (output, format, image) = match args.format {
-        ExtractFormat::Raw => (bytes.as_ref().clone(), "raw", None),
-        ExtractFormat::Png => {
-            let (info, png) = lvgl::decode_image_png(bytes.as_slice())?;
-            (png, "png", Some(image_json(info)))
+        validate_extract_resource(file.size, file.image.is_some(), args.format)?;
+        let destination = if multiple {
+            let mut relative = PathBuf::from(resource);
+            if matches!(args.format, ExtractFormat::Png) {
+                relative.set_extension("png");
+            }
+            args.output.join(relative)
+        } else {
+            args.output.clone()
+        };
+        path_text(&destination)?;
+        if destinations.contains_key(resource) || !output_paths.insert(absolute(&destination)?) {
+            return Err(Failure::new(
+                "duplicate_output",
+                "duplicate resource or colliding extraction output",
+            ));
         }
-    };
-    if let Some(parent) = args.output.parent().filter(|p| !p.as_os_str().is_empty()) {
-        make_dir(parent)?;
+        preflight(&destination, args.force, &resolved.protected)?;
+        destinations.insert(resource.clone(), destination);
     }
-    let staged = stage(&args.output, &output)?;
-    commit(staged, &args.output, args.force)?;
-    Ok(
-        json!({ "resource": args.resource, "output": args.output, "format": format, "size": output.len(), "image": image, "firmwareSha256": resolved.loaded.sha256 }),
-    )
+    for destination in &output_paths {
+        if destination
+            .ancestors()
+            .skip(1)
+            .any(|parent| output_paths.contains(parent))
+        {
+            return Err(Failure::new(
+                "output_conflict",
+                "batch extraction outputs have a file/directory conflict",
+            ));
+        }
+    }
+    let mut staged = Vec::new();
+    let mut resources = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut failure = None;
+    let visited = resolved.loaded.index.visit_file_bytes(
+        &args.resource, project::MAX_TEMPLATE_BYTES, project::MAX_TEMPLATE_BYTES,
+        |resource, bytes| {
+            let result: Result<()> = (|| {
+                eprintln!("Extracting {resource}");
+                let (output, format, image) = match args.format {
+                    ExtractFormat::Raw => (bytes.to_vec(), "raw", None),
+                    ExtractFormat::Png => {
+                        let (info, png) = lvgl::decode_image_png(bytes)?;
+                        (png, "png", Some(image_json(info)))
+                    }
+                };
+                output_bytes = output_bytes.checked_add(output.len()).ok_or_else(|| Failure::new("resource_limit", "extraction byte count overflow"))?;
+                if output_bytes > project::MAX_TEMPLATE_BYTES {
+                    return Err(Failure::new("resource_limit", "batch extraction outputs exceed the 64 MiB budget"));
+                }
+                let destination = &destinations[resource];
+                if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) { make_dir(parent)?; }
+                staged.push((stage(destination, &output)?, destination.clone()));
+                resources.push(json!({"resource":resource,"output":destination,"format":format,"size":output.len(),"image":image}));
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let message = error.message.clone(); failure = Some(error); return Err(message);
+            }
+            Ok(())
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    visited?;
+    let mut published = Vec::new();
+    for (file, destination) in staged {
+        if let Err(mut error) = commit(file, &destination, args.force) {
+            error.details = json!({"outputs":published,"partialCommit":!published.is_empty()});
+            return Err(error);
+        }
+        published.push(destination);
+    }
+    if !multiple {
+        let mut value = resources.remove(0);
+        value["firmwareSha256"] = json!(resolved.loaded.sha256);
+        return Ok(value);
+    }
+    Ok(json!({"resources":resources,"outputs":published,"firmwareSha256":resolved.loaded.sha256}))
 }
 
 fn check_build(selection: Selection, build: Option<(Option<PathBuf>, bool)>) -> Result<Value> {
@@ -628,7 +734,14 @@ fn check_build(selection: Selection, build: Option<(Option<PathBuf>, bool)>) -> 
     for (index, id) in ids.iter().enumerate() {
         // Retain only reports and temp files: each target's pack bytes die before
         // preparing the next target, bounding pack memory independently of target count.
-        let prepared = project::prepare_target(&project, id);
+        eprintln!("Preparing target {}/{}: {id}", index + 1, ids.len());
+        let mut last_progress = std::time::Instant::now();
+        let prepared = project::prepare_target_with_progress(&project, id, |message| {
+            if last_progress.elapsed() >= std::time::Duration::from_secs(1) {
+                eprintln!("{id}: {message}");
+                last_progress = std::time::Instant::now();
+            }
+        });
         reports.push(
             serde_json::to_value(&prepared.report)
                 .map_err(|e| Failure::new("json", e.to_string()))?,
@@ -1126,7 +1239,7 @@ mod tests {
                 theme: None,
                 target: None,
             },
-            resource: "test.bin".into(),
+            resource: vec!["test.bin".into()],
             format: ExtractFormat::Raw,
             output: output.clone(),
             force: false,

@@ -18,6 +18,7 @@ pub const MAX_FIRMWARE_BYTES: usize = 512 * 1024 * 1024;
 /// Bound original templates before inflating or materializing resource bytes.
 pub const MAX_TEMPLATE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXCLUSION_REASON_BYTES: usize = 1024;
 const MAX_PACK_BYTES: usize = 64 * 1024 * 1024;
 
 fn schema_version() -> u32 {
@@ -90,6 +91,8 @@ pub struct Target {
     pub bindings: BTreeMap<String, Binding>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub overrides: BTreeMap<String, Asset>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub excluded: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -154,6 +157,7 @@ pub struct TargetReport {
     pub firmware_sha256: Option<String>,
     pub valid: bool,
     pub resources: Vec<ResourceSummary>,
+    pub excluded: BTreeMap<String, String>,
     pub errors: Vec<Diagnostic>,
     pub warnings: Vec<Diagnostic>,
     pub pack_bytes: usize,
@@ -281,11 +285,12 @@ fn validate_role(role: &str) -> Result<(), String> {
 pub fn validate_target_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 64
+        || id.starts_with('.')
         || !id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        return Err("target ID must be 1-64 ASCII letters, digits, '_' or '-'".into());
+        return Err("target ID must be 1-64 ASCII letters, digits, '_', '-' or '.', and cannot start with '.'".into());
     }
     Ok(())
 }
@@ -365,13 +370,33 @@ pub fn load_firmware(path: &Path, expected_sha256: Option<&str>) -> Result<Loade
     Ok(LoadedFirmware { index, sha256 })
 }
 
+struct RoleWork {
+    role: String,
+    input: PathBuf,
+    options: AssetOptions,
+    source: Option<Vec<u8>>,
+    paths: Vec<String>,
+    remaining: usize,
+}
+
 pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
+    prepare_target_with_progress(project, id, |_| {})
+}
+
+/// Prepare a target while reporting human-readable loading/conversion progress.
+/// The caller chooses where to display it; core never writes to stdout/stderr.
+pub fn prepare_target_with_progress(
+    project: &ThemeProject,
+    id: &str,
+    mut progress: impl FnMut(&str),
+) -> PreparedTarget {
     let mut report = TargetReport {
         schema_version: 1,
         target: id.into(),
         firmware_sha256: None,
         valid: false,
         resources: Vec::new(),
+        excluded: BTreeMap::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
         pack_bytes: 0,
@@ -383,7 +408,9 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
             return PreparedTarget { report, pack: None };
         }
     };
+    report.excluded = target.excluded.clone();
     let firmware_path = target_firmware_path(project, id, &target);
+    progress(&format!("Loading firmware for target {id}"));
     let firmware = match load_firmware(&firmware_path, Some(&target.firmware_sha256)) {
         Ok(firmware) => firmware,
         Err(error) => {
@@ -392,7 +419,12 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
         }
     };
     report.firmware_sha256 = Some(firmware.sha256);
-    for role in target.bindings.keys().chain(target.overrides.keys()) {
+    for role in target
+        .bindings
+        .keys()
+        .chain(target.overrides.keys())
+        .chain(target.excluded.keys())
+    {
         if !project.theme.icons.contains_key(role) {
             report.errors.push(
                 Diagnostic::new(
@@ -403,18 +435,46 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
             );
         }
     }
+    for (role, reason) in &target.excluded {
+        if reason.trim().is_empty()
+            || reason.len() > MAX_EXCLUSION_REASON_BYTES
+            || reason.chars().any(char::is_control)
+        {
+            report.errors.push(
+                Diagnostic::new("exclusion_reason", "exclusion reason must be 1-1024 UTF-8 bytes, nonblank and without control characters")
+                    .at(role, None, None),
+            );
+        }
+        if target.bindings.contains_key(role) || target.overrides.contains_key(role) {
+            report.errors.push(
+                Diagnostic::new(
+                    "excluded_conflict",
+                    "excluded role cannot have a binding or override",
+                )
+                .at(role, None, None),
+            );
+        }
+    }
     for role in target.overrides.keys() {
-        if !target.bindings.contains_key(role) {
+        if !target.bindings.contains_key(role) && !target.excluded.contains_key(role) {
             report.errors.push(
                 Diagnostic::new("unused_override", "target override has no binding")
                     .at(role, None, None),
             );
         }
     }
+    // Keep source assets under a single aggregate budget, rather than retaining
+    // an unbounded asset per role. Each is read once and released after its last
+    // resource has been converted (physical order may interleave roles).
+    let mut work = Vec::<RoleWork>::new();
     let mut claimed_paths = BTreeSet::new();
-    let mut replacements = BTreeMap::new();
-    let mut total_bytes = 0usize;
+    let mut source_bytes = 0usize;
+    let mut template_bytes = 0usize;
+    let mut template_budget_exceeded = false;
     for (role, shared_asset) in &project.theme.icons {
+        if target.excluded.contains_key(role) {
+            continue;
+        }
         let Some(binding) = target.bindings.get(role) else {
             report.errors.push(
                 Diagnostic::new("missing_binding", "icon role has no binding in this target")
@@ -435,16 +495,27 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
         }
         let options = target.overrides.get(role).unwrap_or(shared_asset).options();
         let input = project.root.join(&options.input);
+        progress(&format!("Loading asset for role {role}"));
         let source = if options.input.as_os_str().is_empty() {
             Err("asset input path cannot be empty".into())
         } else {
-            read_limited(&input, MAX_ASSET_BYTES)
+            read_limited(&input, MAX_ASSET_BYTES.saturating_sub(source_bytes))
         };
-        if let Err(error) = &source {
-            report
-                .errors
-                .push(Diagnostic::new("asset_input", error.clone()).at(role, None, Some(&input)));
-        }
+        let source = match source {
+            Ok(bytes) => {
+                source_bytes += bytes.len();
+                Some(bytes)
+            }
+            Err(error) => {
+                report.errors.push(Diagnostic::new("asset_input", error).at(
+                    role,
+                    None,
+                    Some(&input),
+                ));
+                None
+            }
+        };
+        let mut valid_paths = Vec::new();
         for path in paths {
             if let Err(error) = crpack::validate_relative_path(path) {
                 report
@@ -476,102 +547,147 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
                 );
                 continue;
             };
-            let Ok(source) = &source else {
-                continue;
-            };
-            let (bytes, lossy) = match options.mode {
-                AssetMode::Raw => (source.clone(), false),
-                AssetMode::Png => {
-                    if file.image.is_none() {
-                        report.errors.push(
-                            Diagnostic::new(
-                                "unsupported_template",
-                                "original resource is not a supported image template",
-                            )
-                            .at(role, Some(path), Some(&input)),
-                        );
-                        continue;
-                    }
-                    if file.size > MAX_TEMPLATE_BYTES {
-                        report.errors.push(
-                            Diagnostic::new(
-                                "template_size",
-                                "original template exceeds the 64 MiB conversion limit",
-                            )
-                            .at(role, Some(path), Some(&input)),
-                        );
-                        continue;
-                    }
-                    let template = match firmware.index.file_bytes(path) {
-                        Ok(Some(template)) => template,
-                        Ok(None) => unreachable!("resource metadata already exists"),
-                        Err(error) => {
-                            report
-                                .errors
-                                .push(Diagnostic::new("resource_read", error).at(
-                                    role,
-                                    Some(path),
-                                    Some(&input),
-                                ));
-                            continue;
-                        }
-                    };
-                    match lvgl::encode_png_to_template_detailed(
-                        source,
-                        &template,
-                        options.allow_quantize,
-                    ) {
-                        Ok(encoded) => (encoded.bytes, encoded.lossy_quantization),
-                        Err(error) => {
-                            report
-                                .errors
-                                .push(Diagnostic::new("image_conversion", error).at(
-                                    role,
-                                    Some(path),
-                                    Some(&input),
-                                ));
-                            continue;
-                        }
-                    }
+            if options.mode == AssetMode::Png {
+                if file.image.is_none() {
+                    report.errors.push(
+                        Diagnostic::new(
+                            "unsupported_template",
+                            "original resource is not a supported image template",
+                        )
+                        .at(role, Some(path), Some(&input)),
+                    );
+                    continue;
                 }
-            };
-            if options.mode == AssetMode::Raw {
-                report.warnings.push(
-                    Diagnostic::new(
-                        "raw_unverified",
-                        "raw replacement is copied without certifying its device-specific format",
-                    )
-                    .at(role, Some(path), Some(&input)),
-                );
+                if file.size > MAX_TEMPLATE_BYTES {
+                    report.errors.push(
+                        Diagnostic::new(
+                            "template_size",
+                            "original template exceeds the 64 MiB conversion limit",
+                        )
+                        .at(role, Some(path), Some(&input)),
+                    );
+                    continue;
+                }
             }
-            if lossy {
-                report.warnings.push(Diagnostic::new("lossy_conversion", "conversion reduced color precision or discarded transparency; inspect the result").at(role, Some(path), Some(&input)));
-            }
-            if bytes.len() > MAX_PACK_BYTES.saturating_sub(total_bytes) {
-                report.errors.push(
-                    Diagnostic::new(
-                        "pack_size",
-                        "replacement files exceed the 64 MiB CRPack limit",
-                    )
-                    .at(role, Some(path), Some(&input)),
-                );
+            if source.is_none() {
                 continue;
             }
-            total_bytes += bytes.len();
-            report.resources.push(ResourceSummary {
+            if options.mode == AssetMode::Png {
+                template_bytes = template_bytes.saturating_add(file.size);
+                if template_bytes > MAX_TEMPLATE_BYTES && !template_budget_exceeded {
+                    template_budget_exceeded = true;
+                    report.errors.push(
+                        Diagnostic::new(
+                            "template_size",
+                            "original templates exceed the aggregate 64 MiB conversion limit",
+                        )
+                        .at(role, Some(path), Some(&input)),
+                    );
+                }
+            }
+            valid_paths.push(path.to_owned());
+        }
+        if valid_paths.is_empty() {
+            source_bytes -= source.as_ref().map_or(0, Vec::len);
+        } else {
+            let remaining = valid_paths.len();
+            work.push(RoleWork {
                 role: role.clone(),
-                resource: path.into(),
-                input: input.clone(),
-                mode: options.mode,
-                size_bytes: bytes.len(),
-                format: file.image.map(|info| info.format.display_name().into()),
-                width: file.image.map(|info| info.width),
-                height: file.image.map(|info| info.height),
-                lossy,
+                input,
+                options,
+                source,
+                paths: valid_paths,
+                remaining,
             });
-            replacements.insert(path.into(), bytes);
         }
     }
+    let mut replacements = BTreeMap::new();
+    let mut total_bytes = 0usize;
+    let mut template_paths = Vec::new();
+    let mut owners = BTreeMap::new();
+    for (index, role) in work.iter_mut().enumerate() {
+        if role.options.mode == AssetMode::Raw {
+            progress(&format!("Converting role {}", role.role));
+            let source = role.source.take().expect("validated source");
+            for path in &role.paths {
+                // Check before cloning a raw source for multiple resources.
+                if source.len() > MAX_PACK_BYTES.saturating_sub(total_bytes) {
+                    report.errors.push(
+                        Diagnostic::new(
+                            "pack_size",
+                            "replacement files exceed the 64 MiB CRPack limit",
+                        )
+                        .at(&role.role, Some(path), Some(&role.input)),
+                    );
+                    continue;
+                }
+                record_replacement(
+                    &mut report,
+                    &mut replacements,
+                    &mut total_bytes,
+                    role,
+                    firmware.index.file(path).expect("validated resource"),
+                    source.clone(),
+                    false,
+                );
+            }
+        } else {
+            for path in &role.paths {
+                template_paths.push(path.clone());
+                owners.insert(path.clone(), index);
+            }
+        }
+    }
+    if !template_budget_exceeded {
+        let mut notified = BTreeSet::new();
+        let result = firmware.index.visit_file_bytes(
+            &template_paths,
+            MAX_TEMPLATE_BYTES,
+            MAX_TEMPLATE_BYTES,
+            |path, template| {
+                let role = &mut work[owners[path]];
+                if notified.insert(role.role.clone()) {
+                    progress(&format!("Converting role {}", role.role));
+                }
+                match lvgl::encode_png_to_template_detailed(
+                    role.source.as_ref().expect("validated source"),
+                    template,
+                    role.options.allow_quantize,
+                ) {
+                    Ok(encoded) => record_replacement(
+                        &mut report,
+                        &mut replacements,
+                        &mut total_bytes,
+                        role,
+                        firmware.index.file(path).expect("validated resource"),
+                        encoded.bytes,
+                        encoded.lossy_quantization,
+                    ),
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(Diagnostic::new("image_conversion", error).at(
+                                &role.role,
+                                Some(path),
+                                Some(&role.input),
+                            ))
+                    }
+                }
+                role.remaining -= 1;
+                if role.remaining == 0 {
+                    role.source.take();
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            report.errors.push(Diagnostic::new("resource_read", error));
+        }
+    }
+    // Reports remain deterministic by semantic role/path, independent of ROMFS layout.
+    report
+        .resources
+        .sort_by(|a, b| (&a.role, &a.resource).cmp(&(&b.role, &b.resource)));
     if project.theme.icons.is_empty() {
         report.errors.push(Diagnostic::new(
             "empty_theme",
@@ -605,4 +721,59 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
         None
     };
     PreparedTarget { report, pack }
+}
+
+fn record_replacement(
+    report: &mut TargetReport,
+    replacements: &mut BTreeMap<String, Vec<u8>>,
+    total_bytes: &mut usize,
+    work: &RoleWork,
+    file: &crate::firmware::ResourceFile,
+    bytes: Vec<u8>,
+    lossy: bool,
+) {
+    let role = work.role.as_str();
+    let input = work.input.as_path();
+    let mode = work.options.mode;
+    if mode == AssetMode::Raw {
+        report.warnings.push(
+            Diagnostic::new(
+                "raw_unverified",
+                "raw replacement is copied without certifying its device-specific format",
+            )
+            .at(role, Some(&file.path), Some(input)),
+        );
+    }
+    if lossy {
+        report.warnings.push(
+            Diagnostic::new(
+                "lossy_conversion",
+                "conversion reduced color precision or discarded transparency; inspect the result",
+            )
+            .at(role, Some(&file.path), Some(input)),
+        );
+    }
+    if bytes.len() > MAX_PACK_BYTES.saturating_sub(*total_bytes) {
+        report.errors.push(
+            Diagnostic::new(
+                "pack_size",
+                "replacement files exceed the 64 MiB CRPack limit",
+            )
+            .at(role, Some(&file.path), Some(input)),
+        );
+        return;
+    }
+    *total_bytes += bytes.len();
+    report.resources.push(ResourceSummary {
+        role: role.into(),
+        resource: file.path.clone(),
+        input: input.to_path_buf(),
+        mode,
+        size_bytes: bytes.len(),
+        format: file.image.map(|info| info.format.display_name().into()),
+        width: file.image.map(|info| info.width),
+        height: file.image.map(|info| info.height),
+        lossy,
+    });
+    replacements.insert(file.path.clone(), bytes);
 }

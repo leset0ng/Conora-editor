@@ -34,7 +34,9 @@ conora build --theme my-icons --all-targets --output ./packs
 
 After the core and CLI crates are published to crates.io, installation will also be available with `cargo install conora-cli --locked`. They are not published by this repository change.
 
-See [the CLI guide](crates/conora-cli/README.md) for schemas, extraction, overrides, machine-readable diagnostics and safety rules.
+Existing packs can be imported with `conora import pack.crpack --into ./theme --firmware firmware.bin --target p67-3.101.043`. `conora plan --theme ./theme --from p67-3.101.043 --target q66-4.100.155` proposes bindings without changing them; `conora preview --theme ./theme --target q66-4.100.155 --verify` previews actual encoded resources and verifies conversion. Explicit target exclusions let one firmware retain icons another firmware cannot use. Native batch operations traverse compressed resources once instead of restarting decompression for every icon.
+
+See [the CLI guide](crates/conora-cli/README.md) for import preservation/limitations, schemas, extraction, exclusions, planning, previews, machine-readable diagnostics and safety rules.
 
 ## AstroBox plugin build
 

@@ -1,6 +1,6 @@
 [package]
 name = "conora-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Build icon themes for multiple watch firmwares as CRPack resource packs"
@@ -13,11 +13,14 @@ name = "conora"
 path = "src/main.rs"
 
 [dependencies]
-conora-core = { path = "../conora-core", version = "0.1.0" }
+conora-core = { path = "../conora-core", version = "0.2.0" }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
-image = { version = "0.25.10", default-features = false, features = ["png"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

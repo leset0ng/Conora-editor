@@ -55,7 +55,17 @@ conora extract --theme my-icons --target band11-A \
   --output my-icons/previews/confirm.png
 ```
 
-You can inspect/extract a firmware without a theme using `--firmware /path/to/firmware.bin` instead of `--theme ... --target ...`. `ls` returns recognized image dimensions, stride and format along with exact resource paths. Search is a case-sensitive substring match. Unsupported resources remain extractable with `--as raw` (the default).
+You can inspect/extract a firmware without a theme using `--firmware /path/to/firmware.bin` instead of `--theme ... --target ...`. `ls` returns recognized image dimensions, stride and format along with exact resource paths. Search is a case-sensitive substring match. `ls --offset 0 --limit 100` pages large inventories; JSON includes `total`, `offset`, and nullable `nextOffset`. The default remains an unpaginated list. Unsupported resources remain extractable with `--as raw` (the default).
+
+Repeat `--resource` for batch extraction. One resource retains the original output-file behavior; multiple resources interpret `--output` as a directory and preserve resource subdirectories (PNG filenames replace the original extension):
+
+```bash
+conora extract --theme my-icons --target band11-A \
+  --resource app/first/launcher.bin --resource app/second/launcher.bin \
+  --as png --output ./references --json
+```
+
+Batch extraction preflights every path/output and the aggregate 64 MiB input budget before reading resources. Converted outputs also share a 64 MiB budget. Resources are visited in physical ROMFS order, loading the firmware once and traversing a compressed resource stream once; staging precedes publication. Duplicate resources, colliding output aliases and file/directory conflicts are rejected.
 
 Declare shared source assets in `theme.json`:
 
@@ -103,7 +113,21 @@ A role can bind multiple copies in a firmware:
 }
 ```
 
-These snippets show fields to edit in the existing target config, not complete standalone configs. Every theme role needs a nonempty binding in each selected target. Unknown roles, repeated resource paths and nonexistent firmware resources are errors. Target IDs are 1-64 ASCII letters, digits, `_` or `-`. Config schema versions other than 1 and unknown config fields are rejected.
+These snippets show fields to edit in the existing target config, not complete standalone configs. Every theme role needs either a nonempty binding or an explicit exclusion in each selected target. Unknown roles, repeated resource paths and nonexistent firmware resources are errors. Target IDs are 1-64 ASCII letters, digits, `.`, `_` or `-`, but cannot start with `.`; `p67-3.101.043` is valid, while hidden filenames, traversal and path separators are rejected. Config schema versions other than 1 and unknown config fields are rejected.
+
+### Explicit target exclusions
+
+Keep all artwork in the shared theme even if a particular firmware has no equivalent slot:
+
+```json
+{
+  "excluded": {
+    "timer_48": "This firmware has no small timer launcher slot; do not replace control buttons."
+  }
+}
+```
+
+Exclusion reasons must be nonblank, at most 1024 UTF-8 bytes, and free of control characters. An excluded role cannot also have a binding or override. Unknown excluded roles are errors. Missing bindings without an explicit exclusion still fail validation. Check/build reports expose `excluded` with its reasons; excluded assets are not read. This lets the original firmware keep its complete icon set while another target intentionally skips unavailable slots.
 
 ### Target-specific source overrides
 
@@ -137,6 +161,46 @@ A string asset is shorthand for PNG conversion without palette quantization. A d
 
 For arbitrary binary replacement, use `{"input": "assets/file.bin", "mode": "raw"}`. Bytes are copied unchanged; diagnostics warn that the device-specific format is not certified.
 
+## Import an existing pack
+
+```bash
+conora import recircle.crpack --into ./recircle \
+  --firmware /path/to/p67.bin --target p67-3.101.043 --json
+```
+
+- The destination must be new. Import stages and validates a complete project before atomically publishing it without replacing an existing directory, including racing empty directories or symlinks. Supported publication platforms are macOS/iOS, Linux/Android and Windows; unsupported no-replace filesystems/platforms fail safely.
+- Metadata and the original archive/manifest are preserved in `source/original.crpack` and `source/canora.json`; original resource bytes are in `source/raw/`. `source/import.json` records mappings, diagnostics and unbound files.
+- Bindings are resolved from the actual ordered source/destination mappings, including archive renames; filenames alone are not evidence. Missing firmware resources, ambiguous/order-dependent rules and mappings outside `/resource/` fail rather than being guessed.
+- Supported images become shared editable PNGs. Unsupported or malformed images remain explicit raw assets, with diagnostics. Unmapped archive files are preserved but not included in builds, and this limitation is reported.
+- **The imported target has raw overrides for decoded PNG roles, preserving the original mapped resource bytes.** To use edited PNG artwork for that target, remove the corresponding override. New targets added afterward have no overrides and use shared PNG conversion. Raw-original warnings are deliberate: byte preservation is not device-format certification.
+- Builds are not lossless copies of arbitrary third-party packages: archive layout/mapping renames are normalized to resource paths; unmapped files, unknown manifest fields and the original target list remain in the preserved source, not necessarily in generated packs. Original mapped replacement bytes are preserved; the ZIP container is not.
+
+## Read-only adaptation planning
+
+```bash
+conora target add q66-4.100.155 --theme ./recircle --firmware /path/to/q66.bin
+conora plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 --json
+conora plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 \
+  --compare-images --json
+```
+
+Planning loads both pinned firmware inventories but **never modifies configs or creates output files**. It returns up to five deterministic candidates per role, source/candidate dimensions, path/name/alias hints, current bindings/exclusions and unmatched roles. Numeric size suffixes alone are not semantic matching tokens. `score` is a lexical ranking, not a calibrated confidence or compatibility guarantee.
+
+Optional `artworkSimilarity` compares normalized, alpha-premultiplied pixels only for shortlisted candidates. Different stock artwork can still represent the same application. Missing/undecodable artwork and the bounded 64 MiB comparison budget produce warnings without discarding lexical candidates. Review application meaning, dynamic-image backgrounds, one-to-many slots and size variants before manually editing target bindings/exclusions. Planning supports at most 4096 roles per invocation.
+
+## Preview and verify actual encoded resources
+
+```bash
+conora preview --theme ./recircle --target q66-4.100.155 --verify --json
+conora preview --theme ./recircle --all-targets --output ./previews --force --json
+```
+
+Preview prepares current target packs in memory, then decodes **the actual encoded replacements**, not the source images. It does not publish `.crpack` files or inspect a stale existing `dist/` file. Individual PNGs are at most 2048 pixels per side; paginated contact sheets use 112-pixel tiles, eight columns and at most 256 tiles per page. `preview_index-<target>.json` maps each tile/PNG ID to its role, resource, dimensions and original manifest. No font dependency is needed for raster labels: the adjacent JSON index is authoritative.
+
+`--verify` checks PNG-mode replacements against pinned native metadata/fixed LVGL headers and nearest-resized source pixels. Intrinsic/opted-in lossy conversion reports `samePixels: false` rather than falsely claiming pixel identity. Raw resources have `verification.status: "notApplicable"`; raw nonimages are explicitly skipped. Top-level index `verified` is true only when every replacement has a conversion verification result; `verificationRequested` records the option separately. Verification is not an on-device appearance or dynamic-rendering guarantee.
+
+Inputs/decoded images are bounded, output filenames are collision-checked, and inputs remain protected even with `--force`. All selected targets finish validation/staging before any final preview files are committed. Filesystem commit failures report `outputs` and `partialCommit`, like build.
+
 ## Check and build
 
 ```bash
@@ -167,6 +231,8 @@ Check/build results contain `targets`, an array of target reports. Successful bu
 
 On failure, top-level `errors` describes the command failure. Validation failures retain the per-target reports so an agent can fix multiple independent issues in one iteration. Successful resources in a failed report do not imply that a pack was emitted.
 
+Import/build/check/preview and batch extraction emit bounded progress messages to stderr. `--json` stdout remains one parseable JSON document; progress is never embedded in it. Original-import raw warnings are retained in target reports, and planning warnings are advisory.
+
 Exit codes:
 
 | Code | Meaning |
@@ -177,7 +243,7 @@ Exit codes:
 
 ## Limits and boundaries
 
-Native CLI firmware inputs are limited to 512 MiB; config files to 1 MiB; source assets, original conversion templates and extracted resources to 64 MiB each. PNG decoding is additionally limited to 16 * 1024 * 1024 pixels. Inputs must be regular files; Unix FIFOs are rejected without blocking. Native CLI paths used in configs/results must be representable in UTF-8.
+Native CLI firmware inputs are limited to 512 MiB; config files to 1 MiB; source assets, original conversion templates and extracted resources to 64 MiB each. Project preparation additionally limits aggregate retained source assets and selected conversion templates to 64 MiB per target, and batch extraction applies aggregate 64 MiB budgets to both inputs and outputs. Single-resource browser reads remain lazy; native multi-resource preparation uses a bounded forward-only scan instead of restarting deflate for each icon. PNG decoding is additionally limited to 16 * 1024 * 1024 pixels. Inputs must be regular files; Unix FIFOs are rejected without blocking. Native CLI paths used in configs/results must be representable in UTF-8.
 
 CRPack output follows v1: one root `canora.json`, safe resource paths, at most 256 mappings, at most 64 KiB manifest, at most 32 KiB generated mapping configuration and at most 64 MiB total uncompressed content including the manifest. The container has no file-count cap; Interconnect transfers still have a 65,536-file index limit, and older Managers can impose further limits. `mappings.tsv` is derived on-device and must not be included in a pack.
 

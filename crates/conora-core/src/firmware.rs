@@ -175,6 +175,54 @@ impl FirmwareIndex {
         Ok(Some(bytes))
     }
 
+    /// Visit each distinct requested resource in physical order, without caching it.
+    /// All paths and budgets are checked before any resource is materialized or
+    /// the callback is invoked. A callback error stops the traversal immediately.
+    pub fn visit_file_bytes(
+        &self,
+        paths: &[String],
+        max_file_bytes: usize,
+        max_total_bytes: usize,
+        mut callback: impl FnMut(&str, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        let mut files = Vec::new();
+        let mut total = 0usize;
+        let mut errors = Vec::new();
+        for path in paths {
+            if !seen.insert(path.as_str()) {
+                continue;
+            }
+            let Some(file) = self.file(path) else {
+                errors.push(format!("resource path does not exist: {path}"));
+                continue;
+            };
+            if file.size > max_file_bytes {
+                errors.push(format!(
+                    "resource {path} exceeds the {max_file_bytes}-byte per-file limit"
+                ));
+            }
+            match total.checked_add(file.size) {
+                Some(size) => total = size,
+                None => {
+                    errors.push("aggregate resource size overflow".into());
+                    total = usize::MAX;
+                }
+            }
+            files.push(file);
+        }
+        if total > max_total_bytes {
+            errors.push(format!(
+                "resources exceed the {max_total_bytes}-byte aggregate limit"
+            ));
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        files.sort_unstable_by_key(|file| file.offset);
+        self.source.visit_ranges(&files, &mut callback)
+    }
+
     pub fn file_thumbnail_pngs(
         &self,
         paths: &[String],
@@ -315,6 +363,55 @@ impl FirmwareIndex {
 }
 
 impl FirmwareSource {
+    fn visit_ranges(
+        &self,
+        files: &[&ResourceFile],
+        callback: &mut impl FnMut(&str, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::RawRomfs(resource) => {
+                for file in files {
+                    let end = file
+                        .offset
+                        .checked_add(file.size)
+                        .ok_or_else(|| "selected resource range overflow".to_string())?;
+                    let data = resource
+                        .get(file.offset..end)
+                        .ok_or_else(|| "selected resource range is outside ROMFS".to_string())?;
+                    callback(&file.path, data)?;
+                }
+            }
+            Self::Archive {
+                bytes,
+                resource_index,
+            } => {
+                let mut archive = ZipArchive::new(Cursor::new(bytes.as_slice()))
+                    .map_err(|error| format!("could not reopen firmware archive: {error}"))?;
+                let mut entry = archive
+                    .by_index(*resource_index)
+                    .map_err(|error| format!("could not reopen vela_resource.bin: {error}"))?;
+                let mut reader = ForwardReader::new(&mut entry);
+                for file in files {
+                    reader.advance_to(file.offset as u64)?;
+                    let mut data = Vec::new();
+                    data.try_reserve_exact(file.size).map_err(|error| {
+                        format!(
+                            "could not allocate {} bytes for {}: {error}",
+                            file.size, file.path
+                        )
+                    })?;
+                    data.resize(file.size, 0);
+                    reader.read_exact(&mut data)?;
+                    callback(&file.path, &data)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn thumbnail_ranges(
         &self,
         files: &[&ResourceFile],

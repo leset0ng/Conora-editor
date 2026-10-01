@@ -150,8 +150,14 @@ pub fn inspect_image_header(header: &[u8], image_size: usize) -> Option<ImageInf
     if header.starts_with(b"\x89PNG\r\n\x1a\n") {
         let (width, height) = if header.len() >= 24 && &header[12..16] == b"IHDR" {
             (
-                u32::from_be_bytes([header[16], header[17], header[18], header[19]]) as u16,
-                u32::from_be_bytes([header[20], header[21], header[22], header[23]]) as u16,
+                u16::try_from(u32::from_be_bytes([
+                    header[16], header[17], header[18], header[19],
+                ]))
+                .ok()?,
+                u16::try_from(u32::from_be_bytes([
+                    header[20], header[21], header[22], header[23],
+                ]))
+                .ok()?,
             )
         } else {
             (0, 0)
@@ -350,12 +356,55 @@ fn parse_jpeg_dimensions(data: &[u8]) -> Option<(u16, u16)> {
     None
 }
 
+fn validate_rle_payload(data: &[u8], info: ImageInfo) -> Result<(), String> {
+    if !info.format.is_rle() {
+        return Ok(());
+    }
+    let expanded = data.get(20..24).ok_or("truncated RLE header")?;
+    let expanded = u32::from_le_bytes(expanded.try_into().unwrap()) as usize;
+    let palette = match info.format {
+        ImageFormatKind::Lvgl9I8Rle => PALETTE_BYTES_I8,
+        ImageFormatKind::Lvgl9I4Rle => PALETTE_BYTES_I4,
+        _ => 0,
+    };
+    let expected = usize::from(info.stride) * usize::from(info.height) + palette;
+    // Vendor resources can include trailing decompressed padding after the pixels.
+    if expanded < expected || expanded > 64 * 1024 * 1024 {
+        return Err("RLE expanded payload does not match bounded image dimensions".into());
+    }
+    Ok(())
+}
+
 pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
     let info = inspect_image(data).ok_or_else(|| "Not a recognized image format".to_string())?;
+    validate_rle_payload(data, info)?;
 
     match info.format {
         ImageFormatKind::Png | ImageFormatKind::Jpeg => {
-            let img = image::load_from_memory(data)
+            let reader = || {
+                image::ImageReader::new(Cursor::new(data))
+                    .with_guessed_format()
+                    .map_err(|e| format!("decode failed: {e}"))
+            };
+            let (width, height) = reader()?
+                .into_dimensions()
+                .map_err(|e| format!("decode failed: {e}"))?;
+            if width == 0
+                || height == 0
+                || width > u32::from(u16::MAX)
+                || height > u32::from(u16::MAX)
+                || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+            {
+                return Err("image dimensions exceed the 16-megapixel decoding limit".into());
+            }
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(width);
+            limits.max_image_height = Some(height);
+            limits.max_alloc = Some(MAX_IMAGE_PIXELS * 16 + 1024 * 1024);
+            let mut bounded_reader = reader()?;
+            bounded_reader.limits(limits);
+            let img = bounded_reader
+                .decode()
                 .map_err(|e| format!("decode failed: {e}"))?
                 .to_rgba8();
             let mut resolved_info = info;
@@ -420,7 +469,11 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                 if data.len() < 24 + comp_len {
                     return Err("truncated LVGL9 RLE payload".into());
                 }
-                rle_decompress(&data[24..24 + comp_len], raw_len)
+                let payload = rle_decompress(&data[24..24 + comp_len], raw_len);
+                if payload.len() != raw_len {
+                    return Err("truncated LVGL9 RLE expanded payload".into());
+                }
+                payload
             } else {
                 data[12..].to_vec()
             };
@@ -627,6 +680,7 @@ pub fn encode_png_to_template_detailed(
 
     let template_info =
         inspect_image(template).ok_or_else(|| "unsupported image template format".to_string())?;
+    validate_rle_payload(template, template_info)?;
 
     let width = u32::from(template_info.width);
     let height = u32::from(template_info.height);
@@ -771,7 +825,11 @@ pub fn encode_png_to_template_detailed(
                 let raw_len =
                     u32::from_le_bytes([template[20], template[21], template[22], template[23]])
                         as usize;
-                rle_decompress(&template[24..24 + comp_len], raw_len)
+                let payload = rle_decompress(&template[24..24 + comp_len], raw_len);
+                if payload.len() != raw_len {
+                    return Err("truncated LVGL9 RLE expanded payload".into());
+                }
+                payload
             } else {
                 template[12..].to_vec()
             };
@@ -1338,6 +1396,69 @@ mod tests {
         input[29..33].copy_from_slice(&(!crc).to_be_bytes());
         let error = encode_png_to_template(&input, &sample_template(), false).unwrap_err();
         assert!(error.contains("16-megapixel"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn forged_rle_expansion_is_rejected_before_decoding_or_conversion() {
+        let mut template = vec![0; 26];
+        template[0] = 0x19;
+        template[1] = 0x0a;
+        template[2] = 8;
+        template[4..6].copy_from_slice(&1u16.to_le_bytes());
+        template[6..8].copy_from_slice(&1u16.to_le_bytes());
+        template[8..10].copy_from_slice(&1u16.to_le_bytes());
+        template[16..20].copy_from_slice(&2u32.to_le_bytes());
+        template[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        template[24] = 1;
+        assert!(
+            decode_to_rgba(&template)
+                .unwrap_err()
+                .contains("RLE expanded payload")
+        );
+        let png = png_bytes(RgbaImage::new(1, 1));
+        assert!(
+            encode_png_to_template(&png, &template, false)
+                .unwrap_err()
+                .contains("RLE expanded payload")
+        );
+    }
+
+    #[test]
+    fn rle_vendor_padding_is_valid_but_truncated_expansion_is_not() {
+        let original = sample_template();
+        let mut payload = original[12..].to_vec();
+        payload.push(0);
+        let compressed = rle_compress(&payload);
+        let mut padded = original[..12].to_vec();
+        padded[2] = 8;
+        padded.extend_from_slice(&1u32.to_le_bytes());
+        padded.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        padded.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        padded.extend_from_slice(&compressed);
+        let (_, expected) = decode_to_rgba(&original).unwrap();
+        let (_, actual) = decode_to_rgba(&padded).unwrap();
+        assert_eq!(actual, expected);
+        let png = png_bytes(expected.clone());
+        let converted = encode_png_to_template(&png, &padded, false).unwrap();
+        assert_eq!(decode_to_rgba(&converted).unwrap().1, expected);
+        padded[20..24].copy_from_slice(&((payload.len() + 7) as u32).to_le_bytes());
+        assert!(decode_to_rgba(&padded).unwrap_err().contains("truncated"));
+        assert!(
+            encode_png_to_template(&png, &padded, false)
+                .unwrap_err()
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn raster_metadata_does_not_truncate_large_png_dimensions() {
+        let mut header = vec![0; 24];
+        header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        header[12..16].copy_from_slice(b"IHDR");
+        header[16..20].copy_from_slice(&65536u32.to_be_bytes());
+        header[20..24].copy_from_slice(&1u32.to_be_bytes());
+        assert!(inspect_image(&header).is_none());
+        assert!(decode_to_rgba(&header).is_err());
     }
 
     #[test]
