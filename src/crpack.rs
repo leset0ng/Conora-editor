@@ -5,7 +5,6 @@ use serde_json::{Map, Value, json};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-const MAX_FILES: usize = 128;
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_MAPPINGS: usize = 64;
@@ -53,12 +52,6 @@ pub fn build_crpack(options: &PackOptions<'_>) -> Result<Vec<u8>, String> {
 
     if options.replacements.is_empty() {
         return Err("replace at least one firmware resource before exporting".into());
-    }
-    if options.replacements.len() + 1 > MAX_FILES {
-        return Err(format!(
-            "CRPack v1 allows at most {} files including canora.json",
-            MAX_FILES
-        ));
     }
 
     let mut total_bytes = 0usize;
@@ -157,14 +150,6 @@ pub fn parse_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor)
         .map_err(|error| format!("could not open CRPack archive: {error}"))?;
-
-    if archive.len() > MAX_FILES {
-        return Err(format!(
-            "CRPack contains {} entries, exceeding the maximum of {}",
-            archive.len(),
-            MAX_FILES
-        ));
-    }
 
     let mut manifest_bytes = Vec::new();
     {
@@ -548,6 +533,33 @@ mod tests {
         assert_eq!(unpacked.description.as_deref(), Some("Description of test"));
         assert_eq!(unpacked.target.as_deref(), Some("xiaomi-band-11-4.100.155"));
         assert_eq!(unpacked.replacements, replacements);
+    }
+
+    #[test]
+    fn roundtrips_packs_beyond_the_former_128_file_limit() {
+        for count in [127, 128, 129, 1024] {
+            let replacements: BTreeMap<String, Vec<u8>> = (0..count)
+                .map(|index| {
+                    (
+                        format!("app/icons/icon_{index:04}.bin"),
+                        (index as u32).to_le_bytes().to_vec(),
+                    )
+                })
+                .collect();
+            let bytes = build_crpack(&options(&replacements)).unwrap();
+            let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            assert_eq!(archive.len(), count + 1);
+
+            let mut manifest_bytes = Vec::new();
+            archive
+                .by_name("canora.json")
+                .unwrap()
+                .read_to_end(&mut manifest_bytes)
+                .unwrap();
+            let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+            assert_eq!(manifest["mappings"].as_array().unwrap().len(), 1);
+            assert_eq!(parse_crpack(&bytes).unwrap().replacements, replacements);
+        }
     }
 
     #[test]
