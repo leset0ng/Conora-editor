@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::crpack::{self, PackOptions};
+use crate::app_icons;
+pub use crate::app_icons::AppIconAsset;
+use crate::crpack::{self, Mapping, PackOptions, QuickappIcon};
 use crate::firmware::FirmwareIndex;
 use crate::lvgl;
 
@@ -38,7 +40,12 @@ pub struct Theme {
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
     pub icons: BTreeMap<String, Asset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canopus_icon: Option<AppIconAsset>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quickapp_icons: BTreeMap<String, AppIconAsset>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -93,6 +100,10 @@ pub struct Target {
     pub overrides: BTreeMap<String, Asset>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub excluded: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canopus_icon: Option<AppIconAsset>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quickapp_icons: BTreeMap<String, AppIconAsset>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -266,6 +277,9 @@ pub fn load_theme(path: &Path) -> Result<ThemeProject, String> {
     )?;
     for role in theme.icons.keys() {
         validate_role(role)?;
+    }
+    for package in theme.quickapp_icons.keys() {
+        app_icons::validate_package(package)?;
     }
     Ok(ThemeProject {
         root: path.parent().unwrap().to_path_buf(),
@@ -684,14 +698,67 @@ pub fn prepare_target_with_progress(
             report.errors.push(Diagnostic::new("resource_read", error));
         }
     }
+    let mut explicit_mappings = Vec::new();
+    let mut quickapp_icons = Vec::new();
+    for package in target.quickapp_icons.keys() {
+        if !project.theme.quickapp_icons.contains_key(package) {
+            report.errors.push(Diagnostic::new(
+                "unknown_app_icon",
+                format!("target overrides unknown QuickApp {package}"),
+            ));
+        }
+    }
+    if target.canopus_icon.is_some() && project.theme.canopus_icon.is_none() {
+        report.errors.push(Diagnostic::new(
+            "unknown_app_icon",
+            "target overrides an undeclared Canopus icon",
+        ));
+    }
+    if let Some(asset) = target
+        .canopus_icon
+        .as_ref()
+        .or(project.theme.canopus_icon.as_ref())
+    {
+        progress("Converting Canopus application icon");
+        prepare_app_icon(
+            project,
+            asset,
+            None,
+            &mut report,
+            &mut replacements,
+            &mut total_bytes,
+            &mut source_bytes,
+            &mut template_bytes,
+            &mut explicit_mappings,
+            &mut quickapp_icons,
+        );
+    }
+    for (package, shared) in &project.theme.quickapp_icons {
+        progress(&format!("Converting QuickApp icon {package}"));
+        prepare_app_icon(
+            project,
+            target.quickapp_icons.get(package).unwrap_or(shared),
+            Some(package),
+            &mut report,
+            &mut replacements,
+            &mut total_bytes,
+            &mut source_bytes,
+            &mut template_bytes,
+            &mut explicit_mappings,
+            &mut quickapp_icons,
+        );
+    }
     // Reports remain deterministic by semantic role/path, independent of ROMFS layout.
     report
         .resources
         .sort_by(|a, b| (&a.role, &a.resource).cmp(&(&b.role, &b.resource)));
-    if project.theme.icons.is_empty() {
+    if project.theme.icons.is_empty()
+        && project.theme.canopus_icon.is_none()
+        && project.theme.quickapp_icons.is_empty()
+    {
         report.errors.push(Diagnostic::new(
             "empty_theme",
-            "theme.icons is empty; declare source assets and bind them to firmware resources",
+            "declare firmware source assets or application icons before building",
         ));
     }
     let pack = if report.errors.is_empty() {
@@ -704,7 +771,7 @@ pub fn prepare_target_with_progress(
             target: target.device.as_deref(),
             replacements: &replacements,
         };
-        match crpack::build_crpack(&options) {
+        match crpack::build_crpack_with_icons(&options, &explicit_mappings, &quickapp_icons) {
             Ok(bytes) => {
                 report.valid = true;
                 report.pack_bytes = bytes.len();
@@ -721,6 +788,135 @@ pub fn prepare_target_with_progress(
         None
     };
     PreparedTarget { report, pack }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_app_icon(
+    project: &ThemeProject,
+    asset: &AppIconAsset,
+    package: Option<&str>,
+    report: &mut TargetReport,
+    replacements: &mut BTreeMap<String, Vec<u8>>,
+    total_bytes: &mut usize,
+    source_bytes: &mut usize,
+    template_bytes: &mut usize,
+    mappings: &mut Vec<Mapping>,
+    icons: &mut Vec<QuickappIcon>,
+) {
+    let resource = package
+        .map(app_icons::source)
+        .unwrap_or_else(|| app_icons::CANOPUS_SOURCE.into());
+    let role = package
+        .map(|p| format!("quickapp:{p}"))
+        .unwrap_or_else(|| "canopus".into());
+    let destination = package
+        .map(app_icons::destination)
+        .unwrap_or_else(|| app_icons::CANOPUS_DESTINATION.into());
+    let input_path = project.root.join(&asset.input);
+    let result = (|| {
+        if let Some(package) = package {
+            app_icons::validate_package(package)?;
+        }
+        if replacements.contains_key(&destination) {
+            return Err(format!(
+                "application icon destination conflicts with firmware replacement: {destination}"
+            ));
+        }
+        if asset.input.as_os_str().is_empty() {
+            return Err("application icon input cannot be empty".into());
+        }
+        if asset.mode == AssetMode::Raw && asset.template.is_some() {
+            return Err("raw application icons must not specify a conversion template".into());
+        }
+        let input = read_limited(&input_path, MAX_ASSET_BYTES.saturating_sub(*source_bytes))?;
+        *source_bytes += input.len();
+        let template = if let Some(path) = &asset.template {
+            if path.as_os_str().is_empty() {
+                return Err("application icon template path cannot be empty".into());
+            }
+            let bytes = read_limited(
+                &project.root.join(path),
+                MAX_TEMPLATE_BYTES.saturating_sub(*template_bytes),
+            )?;
+            *template_bytes += bytes.len();
+            Some(bytes)
+        } else if package.is_none() && asset.mode == AssetMode::Png {
+            let bytes = app_icons::canopus_template();
+            if bytes.len() > MAX_TEMPLATE_BYTES.saturating_sub(*template_bytes) {
+                return Err(
+                    "original templates exceed the aggregate 64 MiB conversion limit".into(),
+                );
+            }
+            *template_bytes += bytes.len();
+            Some(bytes)
+        } else {
+            None
+        };
+        let encoded = app_icons::encode_detailed(
+            &input,
+            template.as_deref(),
+            package.is_none(),
+            asset.mode == AssetMode::Raw,
+            asset.allow_quantize,
+        )?;
+        if encoded.bytes.len() > MAX_PACK_BYTES.saturating_sub(*total_bytes) {
+            return Err("replacement files exceed the 64 MiB CRPack limit".into());
+        }
+        Ok(encoded)
+    })();
+    let encoded = match result {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            report.errors.push(Diagnostic::new("app_icon", error).at(
+                &role,
+                Some(&resource),
+                Some(&input_path),
+            ));
+            return;
+        }
+    };
+    let info = lvgl::inspect_image(&encoded.bytes).expect("validated application BIN");
+    if package.is_some() {
+        report.warnings.push(Diagnostic::new("quickapp_receiver_required",
+            "QuickApp icon declarations require an updated Manager/module and a supported exact device target (currently Band 11 .139/.155); app installation and refresh are not verified here")
+            .at(&role, Some(&resource), Some(&input_path)));
+    } else if asset.mode == AssetMode::Png && asset.template.is_none() {
+        report.warnings.push(Diagnostic::new("canopus_preset",
+            "using the known Canopus LVGL v9 117x117 template; other layouts require an explicit template")
+            .at(&role, Some(&resource), Some(&input_path)));
+    }
+    if encoded.lossy_quantization {
+        report.warnings.push(
+            Diagnostic::new(
+                "lossy_conversion",
+                "application icon conversion reduced color precision or transparency",
+            )
+            .at(&role, Some(&resource), Some(&input_path)),
+        );
+    }
+    report.resources.push(ResourceSummary {
+        role,
+        resource: resource.clone(),
+        input: input_path,
+        mode: asset.mode,
+        size_bytes: encoded.bytes.len(),
+        format: Some(info.format.display_name().into()),
+        width: Some(info.width),
+        height: Some(info.height),
+        lossy: encoded.lossy_quantization,
+    });
+    *total_bytes += encoded.bytes.len();
+    replacements.insert(destination.clone(), encoded.bytes);
+    match package {
+        Some(package) => icons.push(QuickappIcon {
+            package: package.into(),
+            destination,
+        }),
+        None => mappings.push(Mapping {
+            source: resource,
+            destination,
+        }),
+    }
 }
 
 fn record_replacement(

@@ -9,6 +9,7 @@ An AstroBox NG API Level 4 Rust/WASM editor and native `conora` CLI for creating
 - Previews files recognized as LVGL images (v9 I8/A8/ARGB8888/I4/A4 uncompressed or RLE, v8 RGB565/I8), PNG, and JPEG.
 - Extracts the selected resource in its current state; recognized image resources can also be converted and extracted as PNG.
 - Replaces a selected resource with a PNG converted against its original BIN template (with bidirectional conversion across supported formats), or with arbitrary file bytes.
+- Edits third-party application icons separately from the firmware tree: Canopus uses its exact runtime-path mapping, while QuickApps use package-based `quickappIcons` declarations.
 - Exports only replaced files plus a root `canora.json` manifest as a `.crpack` ZIP.
 
 PNG conversion keeps the original dimensions and stride. Inputs with the same aspect ratio are automatically scaled up or down to the original dimensions using nearest-neighbor sampling, preserving palette colors and transparent pixels; different aspect ratios are rejected without padding, cropping, or stretching. Same-size inputs are not resampled. PNG inputs are limited to 64 MiB and 16 * 1024 * 1024 pixels. PNGs with more than 256 RGBA colors require opting into lossy quantization. Unsupported BIN formats remain extractable and replaceable as ordinary files, but are not previewed or converted. When a resource has a pending replacement, extraction uses that current replacement; otherwise it extracts the firmware original.
@@ -35,6 +36,24 @@ conora build --theme my-icons --all-targets --output ./packs
 After the core and CLI crates are published to crates.io, installation will also be available with `cargo install conora-cli --locked`. They are not published by this repository change.
 
 Existing packs can be imported with `conora import pack.crpack --into ./theme --firmware firmware.bin --target p67-3.101.043`. `conora plan --theme ./theme --from p67-3.101.043 --target q66-4.100.155` proposes bindings without changing them; `conora preview --theme ./theme --target q66-4.100.155 --verify` previews actual encoded resources and verifies conversion. Explicit target exclusions let one firmware retain icons another firmware cannot use. Native batch operations traverse compressed resources once instead of restarting decompression for every icon.
+
+### Third-party application icons
+
+```bash
+# Canopus uses the known 117x117 LVGL v9 ARGB8888 layout by default.
+conora icon set --canopus ./canopus.png --theme ./my-icons
+# QuickApp PNG conversion requires the application's original LVGL BIN template.
+conora icon set --package ng.lst.corona ./corona.png \
+  --template ./original-icon.bin --theme ./my-icons
+conora icon ls --theme ./my-icons --json
+conora icon remove --package ng.lst.corona --theme ./my-icons
+```
+
+Use `--raw` for an already encoded, supported LVGL BIN. Commands copy assets into the project and update declarations; existing `check`, `preview --verify`, and `build` include these icons without ordinary firmware bindings. Targets can override application assets/templates in their configs. CLI builds still use explicit fingerprinted firmware targets. The plugin's **Third-party application icons** section can import, preview, replace, and export these icons without loading firmware.
+
+Canopus exports an exact mapping from `/data/canopus/manager_icon.bin`; QuickApps export optional `quickappIcons` entries with `package` and a safe archive-relative `.bin` `destination`. Both share the existing CRPack path, rule-count, manifest, TSV, and total-byte limits. Import/re-export preserves these declarations, including normalized `@quickapp-icon/<package>` rules. Package identifiers are opaque exact strings (even empty, Unicode or containing spaces/slashes), never trimmed or treated as paths. Only the 255-byte UTF-8 source budget and forbidden TSV bytes 0–31/127 apply. New QuickApp destinations use `quickapp-icons/<sha256-of-package-UTF8>.bin`; imported safe destinations may be shared by multiple icons.
+
+QuickApp icon application requires an updated device Manager/module and an approved exact device target; the current sibling contract supports Band 11 `.139/.155`, not `.043` or PNG/in-memory source icons. Old receivers may ignore this optional field. The Canopus preset is a layout-only template, not the original artwork, and is not a compatibility claim for other devices; supply an explicit template for another layout. Creating a pack neither installs applications nor writes device files, and successful encoding does not prove Launcher refresh on a watch.
 
 See [the CLI guide](crates/conora-cli/README.md) for import preservation/limitations, schemas, extraction, exclusions, planning, previews, machine-readable diagnostics and safety rules.
 

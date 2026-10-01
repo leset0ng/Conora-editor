@@ -93,6 +93,92 @@ fn oversized_compressed_templates_are_rejected_before_materialization() {
     assert_eq!(built.report.errors[0].code, "template_size");
 }
 
+#[test]
+fn application_icons_build_without_firmware_bindings_and_support_target_templates() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let mut target_config: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("targets/A.json")).unwrap())
+            .unwrap();
+    target_config["bindings"] = json!({});
+    fs::write(
+        directory.path().join("assets/template.bin"),
+        template(8, 8, 0x10),
+    )
+    .unwrap();
+    target_config["quickappIcons"] =
+        json!({"ng.lst.corona": {"input":"assets/icon.png", "template":"assets/template.bin"}});
+    write_json(&directory.path().join("targets/A.json"), &target_config);
+    write_json(
+        &directory.path().join("theme.json"),
+        &json!({
+            "themeId":"dark", "name":"App icons", "icons":{},
+            "canopusIcon":{"input":"assets/icon.png"},
+            "quickappIcons":{"ng.lst.corona":{"input":"assets/icon.png", "template":"assets/template.bin"}}
+        }),
+    );
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    assert_eq!(built.report.resources.len(), 2);
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(
+        pack.mappings[0].source,
+        conora_core::app_icons::CANOPUS_SOURCE
+    );
+    assert_eq!(pack.quickapp_icons[0].package, "ng.lst.corona");
+    assert_eq!(
+        lvgl::inspect_image(
+            &pack.replacements[&conora_core::app_icons::destination("ng.lst.corona")]
+        )
+        .unwrap()
+        .width,
+        8
+    );
+    assert_eq!(
+        lvgl::inspect_image(&pack.replacements["canopus/manager_icon.bin"])
+            .unwrap()
+            .width,
+        117
+    );
+    assert!(
+        built
+            .report
+            .warnings
+            .iter()
+            .any(|w| w.code == "quickapp_receiver_required")
+    );
+}
+
+#[test]
+fn app_icon_validation_collects_missing_templates_and_invalid_raw_inputs() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    write_json(
+        &directory.path().join("theme.json"),
+        &json!({
+            "themeId":"dark", "name":"App icons", "icons":{},
+            "canopusIcon":{"input":"assets/icon.png", "mode":"raw"},
+            "quickappIcons":{"ng.lst.corona":{"input":"assets/icon.png"}}
+        }),
+    );
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("targets/A.json")).unwrap())
+            .unwrap();
+    config["bindings"] = json!({});
+    write_json(&directory.path().join("targets/A.json"), &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(!built.report.valid);
+    assert_eq!(
+        built
+            .report
+            .errors
+            .iter()
+            .filter(|e| e.code == "app_icon")
+            .count(),
+        2
+    );
+}
+
 fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }

@@ -82,7 +82,7 @@ Declare shared source assets in `theme.json`:
 }
 ```
 
-`version`, `author` and `description` are optional. `themeId` is 1-12 lowercase ASCII letters, digits, `_` or `-`. Icon roles are nonempty strings of up to 128 UTF-8 bytes without control characters. Source files are resolved **relative to the theme file**, not the shell working directory. No assets, previews or other files are packaged unless a declared role has an explicit target binding.
+`version`, `author` and `description` are optional. `themeId` is 1-12 lowercase ASCII letters, digits, `_` or `-`. Icon roles are nonempty strings of up to 128 UTF-8 bytes without control characters. Source files are resolved **relative to the theme file**, not the shell working directory. Firmware assets are packaged only through explicit target bindings; native icons described below are independently declared.
 
 Edit each generated `targets/<id>.json`, preserving its actual `firmwareSha256`:
 
@@ -161,6 +161,49 @@ A string asset is shorthand for PNG conversion without palette quantization. A d
 
 For arbitrary binary replacement, use `{"input": "assets/file.bin", "mode": "raw"}`. Bytes are copied unchanged; diagnostics warn that the device-specific format is not certified.
 
+## Canopus and QuickApp icons
+
+These are **filesystem icons, not firmware `/resource/` bindings**. Configure them independently of shared firmware roles:
+
+```bash
+conora icon set --canopus ./canopus.png --theme my-icons
+conora icon set --package org.example.app ./app.png \
+  --template ./original.bin --theme my-icons
+conora icon set --package org.example.app ./replacement.bin --raw --theme my-icons
+conora icon ls --theme my-icons --json
+conora icon remove --canopus --theme my-icons
+conora icon remove --package org.example.app --theme my-icons
+```
+
+Choose exactly one of `--canopus` or `--package PACKAGE` for set/remove. A QuickApp package is an opaque, exact identifier, not a device path. Empty strings, single names, Unicode, spaces, slashes (including a trailing slash), colons, backslashes, and dot patterns are accepted unchanged. No trimming or Unicode normalization is applied; identifiers are case-sensitive. Only wire safety is enforced: `@quickapp-icon/` plus the package must be at most 255 UTF-8 bytes (240 bytes for the package), and bytes 0–31 and 127 are forbidden. Non-ASCII Unicode control characters are not rejected by this byte-level rule. Quote shell arguments to preserve spaces, and use `--package ""` for an empty identifier. The CLI never guesses a QuickApp installation path.
+
+PNG QuickApp icons require an original **LVGL BIN** `--template`. Canopus PNGs default to a synthesized, blank LVGL v9 117×117 ARGB8888 layout; this is a **known preset, not a universal device template**. Supply `--template original.bin` for other layouts/devices. Aspect ratios must match; conversions resize with nearest-neighbor sampling. Optional `--allow-quantize` permits palette reduction. `--raw` requires an already supported, decodable LVGL BIN and cannot be combined with `--template` or `--allow-quantize`; a PNG renamed to `.bin` is not accepted.
+
+`set` validates conversion before updating the project, then copies the input and any explicit template into fresh paths under `assets/native-icons/`. Config paths reference these project-owned copies, not your external originals. Repeated sets replace only the declaration and retain previous copies. `remove` also removes only the declaration; copied artwork/templates are never deleted. If any target has an override for that icon, removal is refused with `icon_overridden` and a `targetOverrides` list; remove those overrides explicitly first. Target files are never silently edited, and unreadable target configs block removal rather than being guessed. `ls` is read-only and lists shared theme declarations without loading firmware; target-specific overrides remain visible in target JSON.
+
+Generated `theme.json` declarations look like:
+
+```json
+{
+  "canopusIcon": {"input": "assets/native-icons/icon-unique/input.png", "mode": "png"},
+  "quickappIcons": {
+    "org.example.app": {
+      "input": "assets/native-icons/icon-other/input.png",
+      "mode": "png",
+      "template": "assets/native-icons/icon-other/template.bin"
+    }
+  }
+}
+```
+
+These are fields within a normal theme config, not a complete standalone config. Target configs may supply `canopusIcon` and `quickappIcons` overrides with the same asset shape; all paths remain relative to the theme file. Native icons need no firmware binding and may be the project's only artwork. Check/build/preview still select and fingerprint firmware targets as usual. Preview decodes actual built BINs; `--verify` checks explicit native templates (or the Canopus preset), not unrelated ROMFS resources. Raw BINs have no PNG pixel-verification contract.
+
+Builds emit a mapping with source `/data/canopus/manager_icon.bin` and archive destination `canopus/manager_icon.bin`. QuickApp icons emit a manifest array `quickappIcons` with the exact `package` and a safe `destination` of `quickapp-icons/<sha256-of-package-UTF8>.bin` (64 lowercase hex digits). Generated filenames never contain the package itself and fit the device path budget even with the theme root and longest theme ID. Imported declarations may still refer to any valid existing `.bin` destination, including a shared file. Firmware mappings plus QuickApp declarations share the CRPack limit of 256; duplicate normalized icon sources are rejected. The device Manager normalizes QuickApp sources internally as `@quickapp-icon/<package>`, not an arbitrary device path. Such semantic sources are always file mappings, even when the package ends in `/`.
+
+**Device support warning:** native icon application currently targets Band 11 firmware `.139`/`.155`. Do not assume `.043` supports these PNG/memory-source rendering paths. Successful check/build/preview validates encoding and package structure, not installation, device compatibility or on-watch appearance; install with a matching Manager/device integration.
+
+Reads are bounded (64 MiB per input/template, 1 MiB config). Theme updates are staged and atomically published; inputs/templates/firmware and their symlink/hardlink aliases are protected. Redirected asset directories and symlink theme files are refused. Other project configs cannot be overwritten. Asset publication precedes the config update, so an I/O failure can leave unbound copied assets but never a declaration referencing an incomplete copy.
+
 ## Import an existing pack
 
 ```bash
@@ -170,7 +213,7 @@ conora import recircle.crpack --into ./recircle \
 
 - The destination must be new. Import stages and validates a complete project before atomically publishing it without replacing an existing directory, including racing empty directories or symlinks. Supported publication platforms are macOS/iOS, Linux/Android and Windows; unsupported no-replace filesystems/platforms fail safely.
 - Metadata and the original archive/manifest are preserved in `source/original.crpack` and `source/canora.json`; original resource bytes are in `source/raw/`. `source/import.json` records mappings, diagnostics and unbound files.
-- Bindings are resolved from the actual ordered source/destination mappings, including archive renames; filenames alone are not evidence. Missing firmware resources, ambiguous/order-dependent rules and mappings outside `/resource/` fail rather than being guessed.
+- Bindings are resolved from the actual ordered source/destination mappings, including archive renames; filenames alone are not evidence. Missing firmware resources, ambiguous/order-dependent rules and arbitrary mappings outside `/resource/` fail rather than being guessed. The exact Canopus source and declared/normalized QuickApp icon sources are recognized separately and imported as validated, byte-preserving raw native assets; native-only packs are supported. These icons are not turned into firmware roles or silently dropped. Multiple native consumers may share one original BIN and remain independent declarations. An overlapping ordinary firmware mapping is explicitly rejected rather than discarded. Original archive destinations are normalized on rebuild.
 - Supported images become shared editable PNGs. Unsupported or malformed images remain explicit raw assets, with diagnostics. Unmapped archive files are preserved but not included in builds, and this limitation is reported.
 - **The imported target has raw overrides for decoded PNG roles, preserving the original mapped resource bytes.** To use edited PNG artwork for that target, remove the corresponding override. New targets added afterward have no overrides and use shared PNG conversion. Raw-original warnings are deliberate: byte preservation is not device-format certification.
 - Builds are not lossless copies of arbitrary third-party packages: archive layout/mapping renames are normalized to resource paths; unmapped files, unknown manifest fields and the original target list remain in the preserved source, not necessarily in generated packs. Original mapped replacement bytes are preserved; the ZIP container is not.
@@ -227,7 +270,7 @@ CRPack v1 has no target-dependent resource branches. These builds intentionally 
 
 `--json` is a global option and can appear before or after a command. It writes one JSON result to stdout with `schemaVersion: 1`, `ok` and `command`. Any human diagnostics use stderr. Help/version remain normal text, even with `--json`.
 
-Check/build results contain `targets`, an array of target reports. Successful builds also contain `outputs`. A target report includes `valid`, `firmwareSha256`, successful `resources`, `errors`, `warnings` and `packBytes`. Diagnostics include a stable `code` and a human-readable `message`, plus `role`, `resource` and `input` when applicable. Useful diagnostic codes include `missing_binding`, `missing_resource`, `duplicate_binding`, `asset_input`, `unsupported_template`, `template_size`, `image_conversion`, `pack_validation`, `raw_unverified` and `lossy_conversion`.
+Check/build results contain `targets`, an array of target reports. Successful builds also contain `outputs`. A target report includes `valid`, `firmwareSha256`, successful `resources`, `errors`, `warnings` and `packBytes`. Diagnostics include a stable `code` and a human-readable `message`, plus `role`, `resource` and `input` when applicable. Native icon report resource identities are `/data/canopus/manager_icon.bin` and `@quickapp-icon/<package>`; archive destinations differ as described above. Useful diagnostic codes include `missing_binding`, `missing_resource`, `duplicate_binding`, `asset_input`, `unsupported_template`, `template_size`, `image_conversion`, `pack_validation`, `raw_unverified` and `lossy_conversion`.
 
 On failure, top-level `errors` describes the command failure. Validation failures retain the per-target reports so an agent can fix multiple independent issues in one iteration. Successful resources in a failed report do not imply that a pack was emitted.
 

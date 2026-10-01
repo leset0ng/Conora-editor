@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use astrobox_ng_wit::astrobox::psys_host_v4::{self as psys_host, ui};
@@ -6,20 +6,54 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 
-use crate::crpack::{self, PackOptions};
+use crate::crpack::{self, Mapping, PackOptions, QuickappIcon};
 use crate::firmware::{BrowserEntry, FirmwareIndex};
 use crate::lvgl;
+use conora_core::app_icons;
 
 const MAX_VISIBLE_ENTRIES: usize = 300;
 const MAX_SEARCH_RESULTS: usize = 200;
 const FILE_THUMBNAIL_SIZE: u32 = 28;
 const SAVE_CHUNK_BYTES: usize = 256 * 1024;
+const MAX_ICON_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResourceFilter {
     All,
     Images,
     Replaced,
+}
+
+#[derive(Clone)]
+struct IconAsset {
+    bytes: Arc<Vec<u8>>,
+    preview_uri: Option<String>,
+}
+
+impl IconAsset {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self::shared(Arc::new(bytes))
+    }
+
+    fn shared(bytes: Arc<Vec<u8>>) -> Self {
+        let preview_uri = preview_from_bytes(bytes.as_slice()).0;
+        Self { bytes, preview_uri }
+    }
+}
+
+struct QuickappEntry {
+    declaration: QuickappIcon,
+    template: Option<Arc<Vec<u8>>>,
+    asset: Option<IconAsset>,
+}
+
+#[derive(Clone)]
+struct IconSnapshot {
+    name: String,
+    destination: String,
+    template_info: Option<lvgl::I8Info>,
+    size: Option<usize>,
+    preview_uri: Option<String>,
 }
 
 struct UiState {
@@ -33,6 +67,12 @@ struct UiState {
     preview_uri: Option<String>,
     thumbnail_cache: BTreeMap<String, Option<String>>,
     replacements: BTreeMap<String, Vec<u8>>,
+    mappings: Vec<Mapping>,
+    imported_paths: BTreeSet<String>,
+    canopus_destination: String,
+    canopus: Option<IconAsset>,
+    quickapps: Vec<QuickappEntry>,
+    quickapp_package: String,
     theme_id: String,
     pack_name: String,
     version: String,
@@ -47,9 +87,9 @@ struct UiState {
 
 static UI_STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
 
-fn ui_state() -> &'static Mutex<UiState> {
-    UI_STATE.get_or_init(|| {
-        Mutex::new(UiState {
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
             root_element_id: None,
             firmware_name: String::new(),
             firmware: None,
@@ -60,6 +100,12 @@ fn ui_state() -> &'static Mutex<UiState> {
             preview_uri: None,
             thumbnail_cache: BTreeMap::new(),
             replacements: BTreeMap::new(),
+            mappings: Vec::new(),
+            imported_paths: BTreeSet::new(),
+            canopus_destination: app_icons::CANOPUS_DESTINATION.into(),
+            canopus: None,
+            quickapps: Vec::new(),
+            quickapp_package: String::new(),
             theme_id: "conora".into(),
             pack_name: "Conora Resource Pack".into(),
             version: "1.0.0".into(),
@@ -68,10 +114,14 @@ fn ui_state() -> &'static Mutex<UiState> {
             target: String::new(),
             allow_quantize: false,
             busy: false,
-            status: "选择手环固件以开始浏览资源。".into(),
+            status: "选择固件浏览资源，或直接编辑第三方应用图标。".into(),
             error: None,
-        })
-    })
+        }
+    }
+}
+
+fn ui_state() -> &'static Mutex<UiState> {
+    UI_STATE.get_or_init(|| Mutex::new(UiState::default()))
 }
 
 #[derive(Clone)]
@@ -92,6 +142,11 @@ struct UiSnapshot {
     selected_replaced: bool,
     preview_uri: Option<String>,
     replacement_count: usize,
+    firmware_replacement_count: usize,
+    icon_replacement_count: usize,
+    canopus: IconSnapshot,
+    quickapps: Vec<IconSnapshot>,
+    quickapp_package: String,
     replacement_sizes: BTreeMap<String, usize>,
     theme_id: String,
     pack_name: String,
@@ -106,7 +161,8 @@ struct UiSnapshot {
 }
 
 fn snapshot(state: &mut UiState) -> UiSnapshot {
-    let (file_count, image_count, entries, hidden_entries) = if let Some(firmware) = &state.firmware {
+    let (file_count, image_count, entries, hidden_entries) = if let Some(firmware) = &state.firmware
+    {
         let total_files = firmware.file_count();
         let total_images = firmware.image_count();
         let is_images_only = state.filter_mode == ResourceFilter::Images;
@@ -128,11 +184,7 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
                     let original = firmware.file(path);
                     let image = lvgl::inspect_i8(bytes.as_slice())
                         .or_else(|| original.and_then(|file| file.image));
-                    let name = path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(path.as_str())
-                        .to_string();
+                    let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
                     list.push(BrowserEntry {
                         name,
                         path: path.clone(),
@@ -143,7 +195,9 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
                         has_replacements: true,
                     });
                 }
-                list.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+                list.sort_by(|left, right| {
+                    left.path.to_lowercase().cmp(&right.path.to_lowercase())
+                });
                 let hidden = list.len().saturating_sub(MAX_SEARCH_RESULTS);
                 (list.into_iter().take(MAX_SEARCH_RESULTS).collect(), hidden)
             }
@@ -154,10 +208,8 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
                         if entry.is_directory {
                             entry.child_count = firmware.file_count_in_dir(&entry.path);
                             let prefix = format!("{}/", entry.path);
-                            entry.has_replacements = state
-                                .replacements
-                                .keys()
-                                .any(|k| k.starts_with(&prefix));
+                            entry.has_replacements =
+                                state.replacements.keys().any(|k| k.starts_with(&prefix));
                             if is_images_only {
                                 firmware.dir_has_images(&entry.path)
                             } else {
@@ -283,12 +335,12 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
                 .and_then(|bytes| lvgl::inspect_image(bytes))
         } else if let Some(file) = selected {
             if let Some(mut info) = file.image {
-                if info.width == 0 && info.height == 0 {
-                    if let Ok(Some(bytes)) = state.firmware.as_ref().unwrap().file_bytes(path) {
-                        if let Some(inspected) = lvgl::inspect_image(bytes.as_slice()) {
-                            info = inspected;
-                        }
-                    }
+                if info.width == 0
+                    && info.height == 0
+                    && let Ok(Some(bytes)) = state.firmware.as_ref().unwrap().file_bytes(path)
+                    && let Some(inspected) = lvgl::inspect_image(bytes.as_slice())
+                {
+                    info = inspected;
                 }
                 Some(info)
             } else {
@@ -316,7 +368,28 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
         selected_template_image,
         selected_replaced,
         preview_uri: state.preview_uri.clone(),
-        replacement_count: state.replacements.len(),
+        replacement_count: replacement_count(state),
+        firmware_replacement_count: state.replacements.len(),
+        icon_replacement_count: icon_replacement_count(state),
+        canopus: icon_snapshot(
+            "Canopus",
+            &state.canopus_destination,
+            Some(&app_icons::canopus_template()),
+            state.canopus.as_ref(),
+        ),
+        quickapps: state
+            .quickapps
+            .iter()
+            .map(|entry| {
+                icon_snapshot(
+                    &entry.declaration.package,
+                    &entry.declaration.destination,
+                    entry.template.as_ref().map(|bytes| bytes.as_slice()),
+                    entry.asset.as_ref(),
+                )
+            })
+            .collect(),
+        quickapp_package: state.quickapp_package.clone(),
         replacement_sizes: state
             .replacements
             .iter()
@@ -417,6 +490,32 @@ async fn process_click(event_id: &str) {
             }
             render_current();
         }
+        "icons.canopus.png" => begin_icon_pick(None, IconPick::Png).await,
+        "icons.canopus.bin" => begin_icon_pick(None, IconPick::Binary).await,
+        "icons.canopus.undo" => {
+            let mut state = lock_state();
+            state.canopus = None;
+            state
+                .mappings
+                .retain(|mapping| mapping.source != app_icons::CANOPUS_SOURCE);
+            state.canopus_destination = app_icons::CANOPUS_DESTINATION.into();
+            state.status = "已撤销 Canopus 图标替换。".into();
+            state.error = None;
+            drop(state);
+            render_current();
+        }
+        "icons.quickapp.add" => add_quickapp(),
+        _ if event_id.starts_with("icons.quickapp.") => {
+            if let Some((action, package)) = event_id["icons.quickapp.".len()..].split_once(':') {
+                match action {
+                    "png" => begin_icon_pick(Some(package), IconPick::Png).await,
+                    "bin" => begin_icon_pick(Some(package), IconPick::Binary).await,
+                    "template" => begin_icon_pick(Some(package), IconPick::Template).await,
+                    "remove" => remove_quickapp(package),
+                    _ => {}
+                }
+            }
+        }
         "replace.png" => begin_png_pick().await,
         "replace.binary" => begin_binary_pick().await,
         "replace.restore" => restore_selected(),
@@ -464,6 +563,10 @@ fn process_change(event_id: &str, payload: &str) {
     let should_render = {
         let mut state = lock_state();
         match event_id {
+            "icons.quickapp.package" => {
+                state.quickapp_package = value;
+                false
+            }
             "browser.search" => {
                 state.search_query = value;
                 false
@@ -583,19 +686,15 @@ async fn begin_firmware_pick() {
                 let mut state = lock_state();
                 state.firmware_name = file_name;
                 state.firmware = Some(firmware);
-                state.current_dir.clear();
-                state.search_query.clear();
-                state.filter_mode = ResourceFilter::All;
-                state.selected_path = None;
-                state.preview_uri = None;
-                state.replacements.clear();
-                state.thumbnail_cache.clear();
+                reset_firmware_resource_edits(&mut state);
                 if !target.is_empty() {
                     state.target = target;
                 }
                 state.busy = false;
-                state.status =
-                    format!("固件已解包，发现 {count} 个资源文件。选择文件查看预览或替换。");
+                let icon_count = icon_replacement_count(&state);
+                state.status = format!(
+                    "固件已解包，发现 {count} 个资源文件。原固件替换已重置；保留 {icon_count} 个第三方图标编辑。"
+                );
                 state.error = None;
             }
         }
@@ -613,12 +712,6 @@ async fn begin_crpack_pick() {
     {
         let mut state = lock_state();
         if state.busy {
-            return;
-        }
-        if state.firmware.is_none() {
-            state.error = Some("请先加载手环固件再导入 CRPack。".into());
-            drop(state);
-            render_current();
             return;
         }
         state.busy = true;
@@ -671,8 +764,8 @@ async fn begin_crpack_pick() {
     }
     render_current();
 
-    let result = crpack::parse_crpack(&picked.data);
-    let selected_refresh_path = match result {
+    let result = parse_ui_pack(&picked.data);
+    match result {
         Ok(unpacked) => {
             let mut state = lock_state();
             state.theme_id = unpacked.theme_id;
@@ -680,54 +773,649 @@ async fn begin_crpack_pick() {
             state.version = unpacked.version.unwrap_or_default();
             state.author = unpacked.author.unwrap_or_default();
             state.description = unpacked.description.unwrap_or_default();
-            if let Some(target) = unpacked.target {
-                if !target.is_empty() {
-                    state.target = target;
-                }
+            if let Some(target) = unpacked.target
+                && !target.is_empty()
+            {
+                state.target = target;
             }
 
-            // Strategy B: completely reset existing replacements and use the imported ones
-            state.replacements = unpacked.replacements;
+            // Import replaces the project; app assets remain outside the firmware tree.
+            import_assets(
+                &mut state,
+                unpacked.replacements,
+                unpacked.mappings,
+                unpacked.quickapp_icons,
+            );
             state.thumbnail_cache.clear();
             state.filter_mode = ResourceFilter::Replaced;
             state.search_query.clear();
             state.busy = false;
 
-            let count = state.replacements.len();
-            let missing_in_firmware_count = state.firmware.as_ref().map_or(0, |fw| {
-                state
-                    .replacements
-                    .keys()
-                    .filter(|path| fw.file(path).is_none())
-                    .count()
-            });
-
-            if missing_in_firmware_count > 0 {
-                state.status = format!(
-                    "已导入「{}」，包含 {} 个资源（其中 {} 个在当前固件中未找到）。",
-                    state.pack_name, count, missing_in_firmware_count
-                );
-            } else {
-                state.status = format!("已导入「{}」，包含 {} 个资源。", state.pack_name, count);
-            }
+            state.preview_uri = state
+                .selected_path
+                .as_deref()
+                .and_then(|path| resource_bytes(&state, path).ok())
+                .and_then(|bytes| preview_from_bytes(bytes.as_slice()).0);
+            state.status = import_confirmation(&state);
             state.error = None;
-
-            state.selected_path.clone()
         }
         Err(error) => {
             let mut state = lock_state();
             state.busy = false;
             state.status = "CRPack 未能导入。".into();
-            state.error = Some(format!("CRPack 解析失败：{error}"));
-            None
+            state.error = Some(format!("CRPack 导入失败：{error}；现有编辑保持不变。"));
         }
-    };
-
-    if let Some(path) = selected_refresh_path {
-        select_file(&path);
-    } else {
-        render_current();
     }
+    render_current();
+}
+
+fn parse_ui_pack(bytes: &[u8]) -> Result<crpack::UnpackedCrpack, String> {
+    let unpacked = crpack::parse_crpack(bytes)?;
+    // Check before touching metadata or assets: unsupported rules cannot be silently lost.
+    validate_ui_mappings(&unpacked.mappings)?;
+    let declarations = normalized_declarations(&unpacked.mappings, unpacked.quickapp_icons.clone());
+    let mut templates = 0usize;
+    for icon in &declarations {
+        let size = unpacked
+            .replacements
+            .get(&icon.destination)
+            .map_or(0, Vec::len);
+        validate_icon_budget(size, templates, 0, true)?;
+        templates += size;
+    }
+    Ok(unpacked)
+}
+
+fn validate_ui_mappings(mappings: &[Mapping]) -> Result<(), String> {
+    for mapping in mappings {
+        if mapping.source.starts_with("/resource/") || mapping.source == app_icons::CANOPUS_SOURCE {
+            continue;
+        }
+        if let Some(package) = mapping
+            .source
+            .strip_prefix(app_icons::QUICKAPP_SOURCE_PREFIX)
+        {
+            app_icons::validate_package(package)?;
+            continue;
+        }
+        return Err(format!(
+            "此编辑器不支持映射来源 {}。仅支持 /resource/、Canopus 图标和 @quickapp-icon/；不会丢弃或转换该映射。",
+            mapping.source,
+        ));
+    }
+    Ok(())
+}
+
+fn import_confirmation(state: &UiState) -> String {
+    let mut status = format!(
+        "已导入「{}」，共 {} 项替换（固件资源 {}，第三方图标 {}）。",
+        state.pack_name,
+        replacement_count(state),
+        state.replacements.len(),
+        icon_replacement_count(state),
+    );
+    if let Some(firmware) = &state.firmware {
+        let missing = state
+            .replacements
+            .keys()
+            .filter(|path| firmware.file(path).is_none())
+            .count();
+        if missing > 0 {
+            status.push_str(&format!("其中 {missing} 个固件资源在当前固件中未找到。"));
+        }
+    }
+    status
+}
+
+fn icon_snapshot(
+    name: &str,
+    destination: &str,
+    template: Option<&[u8]>,
+    asset: Option<&IconAsset>,
+) -> IconSnapshot {
+    IconSnapshot {
+        name: name.into(),
+        destination: destination.into(),
+        template_info: template.and_then(lvgl::inspect_image),
+        size: asset.map(|asset| asset.bytes.len()),
+        preview_uri: asset.and_then(|asset| asset.preview_uri.clone()),
+    }
+}
+
+fn icon_destinations(state: &UiState) -> BTreeSet<&str> {
+    let mut paths = BTreeSet::new();
+    if state.canopus.is_some() {
+        paths.insert(state.canopus_destination.as_str());
+    }
+    for entry in &state.quickapps {
+        if entry.asset.is_some() {
+            paths.insert(entry.declaration.destination.as_str());
+        }
+    }
+    paths
+}
+
+fn replacement_sizes_by_destination(state: &UiState) -> BTreeMap<&str, usize> {
+    let mut sizes = state
+        .replacements
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.len()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(asset) = &state.canopus {
+        sizes.insert(&state.canopus_destination, asset.bytes.len());
+    }
+    for entry in &state.quickapps {
+        if let Some(asset) = &entry.asset {
+            sizes.insert(&entry.declaration.destination, asset.bytes.len());
+        }
+    }
+    sizes
+}
+
+fn icon_replacement_count(state: &UiState) -> usize {
+    icon_destinations(state).len()
+}
+fn replacement_count(state: &UiState) -> usize {
+    replacement_sizes_by_destination(state).len()
+}
+fn replacement_bytes(state: &UiState) -> usize {
+    replacement_sizes_by_destination(state).values().sum()
+}
+fn template_bytes(state: &UiState) -> usize {
+    state
+        .quickapps
+        .iter()
+        .filter_map(|entry| entry.template.as_ref())
+        .map(|bytes| bytes.len())
+        .sum()
+}
+
+fn validate_icon_budget(
+    size: usize,
+    total: usize,
+    old_size: usize,
+    template: bool,
+) -> Result<(), String> {
+    if size > MAX_ICON_BYTES {
+        return Err("单个图标上传不能超过 64 MiB；现有编辑保持不变。".into());
+    }
+    if total.saturating_sub(old_size).saturating_add(size) > MAX_ICON_BYTES {
+        return Err(if template {
+            "原始 BIN 模板总大小不能超过 64 MiB；模板未更改。"
+        } else {
+            "替换资源总大小不能超过 CRPack v1 的 64 MiB 上限；图标未更改。"
+        }
+        .into());
+    }
+    Ok(())
+}
+
+// Loading firmware resets only the firmware workspace, never application edits/templates.
+fn reset_firmware_resource_edits(state: &mut UiState) {
+    state.current_dir.clear();
+    state.search_query.clear();
+    state.filter_mode = ResourceFilter::All;
+    state.selected_path = None;
+    state.preview_uri = None;
+    state.replacements.clear();
+    state.thumbnail_cache.clear();
+    state.imported_paths.clear();
+    state
+        .mappings
+        .retain(|mapping| mapping.source == app_icons::CANOPUS_SOURCE);
+}
+
+fn normalized_declarations(
+    mappings: &[Mapping],
+    mut declarations: Vec<QuickappIcon>,
+) -> Vec<QuickappIcon> {
+    for mapping in mappings {
+        if let Some(package) = mapping
+            .source
+            .strip_prefix(app_icons::QUICKAPP_SOURCE_PREFIX)
+            && !declarations.iter().any(|icon| icon.package == package)
+        {
+            declarations.push(QuickappIcon {
+                package: package.into(),
+                destination: mapping.destination.clone(),
+            });
+        }
+    }
+    declarations
+}
+
+fn import_assets(
+    state: &mut UiState,
+    mut replacements: BTreeMap<String, Vec<u8>>,
+    mappings: Vec<Mapping>,
+    declarations: Vec<QuickappIcon>,
+) {
+    state.imported_paths = replacements.keys().cloned().collect();
+    let declarations = normalized_declarations(&mappings, declarations);
+    let canopus_destination = mappings
+        .iter()
+        .find(|mapping| mapping.source == app_icons::CANOPUS_SOURCE)
+        .map(|mapping| mapping.destination.clone());
+    let mut app_paths = declarations
+        .iter()
+        .map(|icon| icon.destination.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(destination) = &canopus_destination {
+        app_paths.insert(destination.clone());
+    }
+    // Reference all shared assets before removing anything. Firmware-backed paths remain in
+    // the firmware workspace; app-only paths live exclusively in the application state.
+    let assets = app_paths
+        .iter()
+        .filter_map(|path| {
+            replacements
+                .get(path)
+                .map(|bytes| (path.clone(), Arc::new(bytes.clone())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    state.quickapps = declarations
+        .into_iter()
+        .map(|declaration| {
+            let bytes = assets.get(&declaration.destination).cloned();
+            QuickappEntry {
+                declaration,
+                template: bytes.clone(),
+                asset: bytes.map(IconAsset::shared),
+            }
+        })
+        .collect();
+    state.canopus = canopus_destination
+        .as_ref()
+        .and_then(|path| assets.get(path).cloned())
+        .map(IconAsset::shared);
+    state.canopus_destination =
+        canopus_destination.unwrap_or_else(|| app_icons::CANOPUS_DESTINATION.into());
+    for path in &app_paths {
+        let firmware_backed = mappings.iter().any(|mapping| {
+            mapping.source.starts_with("/resource/") && mapping_covers(mapping, path)
+        });
+        if !firmware_backed {
+            replacements.remove(path);
+        }
+    }
+    state.mappings = mappings
+        .into_iter()
+        .filter(|mapping| {
+            !mapping
+                .source
+                .starts_with(app_icons::QUICKAPP_SOURCE_PREFIX)
+        })
+        .collect();
+    state.replacements = replacements;
+    state.quickapp_package.clear();
+}
+
+fn mapping_covers(mapping: &Mapping, path: &str) -> bool {
+    path == mapping.destination
+        || (mapping.destination.ends_with('/') && path.starts_with(&mapping.destination))
+}
+
+type ExportAssets = (BTreeMap<String, Vec<u8>>, Vec<Mapping>, Vec<QuickappIcon>);
+
+fn export_assets(state: &UiState) -> Result<ExportAssets, String> {
+    validate_ui_mappings(&state.mappings)?;
+    let mut replacements = state.replacements.clone();
+    let mut declarations = Vec::new();
+    let mut insert = |destination: &str, asset: &IconAsset| -> Result<(), String> {
+        if let Some(existing) = replacements.get(destination) {
+            if existing.as_slice() != asset.bytes.as_slice() {
+                return Err(format!("共享图标目标内容不一致：{destination}"));
+            }
+            return Ok(());
+        }
+        replacements.insert(destination.into(), asset.bytes.as_ref().clone());
+        Ok(())
+    };
+    if let Some(asset) = &state.canopus {
+        insert(&state.canopus_destination, asset)?;
+    }
+    for entry in &state.quickapps {
+        let asset = entry.asset.as_ref().ok_or_else(|| {
+            format!(
+                "快应用 {} 尚未替换图标；请上传 PNG/BIN 或移除该项。模板不会导出。",
+                entry.declaration.package,
+            )
+        })?;
+        insert(&entry.declaration.destination, asset)?;
+        declarations.push(entry.declaration.clone());
+    }
+    let mut mappings = state
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            if mapping.source == app_icons::CANOPUS_SOURCE && state.canopus.is_none() {
+                return false;
+            }
+            replacements.keys().any(|path| {
+                path == &mapping.destination
+                    || (mapping.destination.ends_with('/')
+                        && path.starts_with(&mapping.destination))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if state.canopus.is_some()
+        && !mappings
+            .iter()
+            .any(|mapping| mapping.source == app_icons::CANOPUS_SOURCE)
+    {
+        mappings.push(Mapping {
+            source: app_icons::CANOPUS_SOURCE.into(),
+            destination: state.canopus_destination.clone(),
+        });
+    }
+    let app_paths = icon_destinations(state);
+    let new_paths = state.replacements.keys().filter(|path| {
+        !state.imported_paths.contains(*path)
+            && !app_paths.contains(path.as_str())
+            && !mappings.iter().any(|mapping| mapping_covers(mapping, path))
+    });
+    let inferred = if state.imported_paths.is_empty() {
+        crpack::firmware_mappings(new_paths)?
+    } else {
+        // Grouping new siblings could accidentally activate an authoritative unused file.
+        new_paths
+            .map(|path| Mapping {
+                source: format!("/resource/{path}"),
+                destination: path.clone(),
+            })
+            .collect()
+    };
+    mappings.extend(inferred);
+    Ok((replacements, mappings, declarations))
+}
+
+fn build_project_pack(state: &UiState) -> Result<Vec<u8>, String> {
+    let (replacements, mappings, declarations) = export_assets(state)?;
+    crpack::build_crpack_with_mappings(
+        &PackOptions {
+            theme_id: &state.theme_id,
+            name: &state.pack_name,
+            version: (!state.version.is_empty()).then_some(state.version.as_str()),
+            author: (!state.author.is_empty()).then_some(state.author.as_str()),
+            description: (!state.description.is_empty()).then_some(state.description.as_str()),
+            target: (!state.target.is_empty()).then_some(state.target.as_str()),
+            replacements: &replacements,
+        },
+        &mappings,
+        &declarations,
+    )
+}
+
+fn insert_quickapp(state: &mut UiState) -> Result<(), String> {
+    let package = state.quickapp_package.clone();
+    app_icons::validate_package(&package)?;
+    if state
+        .quickapps
+        .iter()
+        .any(|entry| entry.declaration.package == package)
+    {
+        return Err("此快应用标识已添加。".into());
+    }
+    state.quickapps.push(QuickappEntry {
+        declaration: QuickappIcon {
+            destination: app_icons::destination(&package),
+            package,
+        },
+        template: None,
+        asset: None,
+    });
+    state.quickapp_package.clear();
+    Ok(())
+}
+
+fn add_quickapp() {
+    let mut state = lock_state();
+    match insert_quickapp(&mut state) {
+        Ok(()) => {
+            state.status =
+                "已添加快应用；PNG 替换需要原始 BIN 模板，也可直接替换 LVGL BIN。".into();
+            state.error = None;
+        }
+        Err(error) => state.error = Some(format!("无法添加快应用：{error}")),
+    }
+    drop(state);
+    render_current();
+}
+
+fn remove_quickapp(package: &str) {
+    let mut state = lock_state();
+    if let Some(index) = state
+        .quickapps
+        .iter()
+        .position(|entry| entry.declaration.package == package)
+    {
+        state.quickapps.remove(index);
+        // The destination may also back another app or an explicit firmware rule.
+        // Canonical QuickApp rules were normalized to declarations during import.
+        state.status = format!("已移除快应用 {package} 的图标与声明。");
+        state.error = None;
+    }
+    drop(state);
+    render_current();
+}
+
+#[derive(Clone, Copy)]
+enum IconPick {
+    Png,
+    Binary,
+    Template,
+}
+
+fn icon_destination<'a>(state: &'a UiState, package: Option<&str>) -> &'a str {
+    package
+        .and_then(|package| {
+            state
+                .quickapps
+                .iter()
+                .find(|entry| entry.declaration.package == package)
+                .map(|entry| entry.declaration.destination.as_str())
+        })
+        .unwrap_or(&state.canopus_destination)
+}
+
+fn validate_icon_input(
+    state: &UiState,
+    package: Option<&str>,
+    mode: IconPick,
+    size: usize,
+) -> Result<(), String> {
+    // PNG output size depends on the layout; input still has an independent single-file cap.
+    validate_icon_budget(size, 0, 0, matches!(mode, IconPick::Template))?;
+    if !matches!(mode, IconPick::Png) {
+        validate_icon_update(state, package, mode, size)?;
+    }
+    Ok(())
+}
+
+fn validate_icon_update(
+    state: &UiState,
+    package: Option<&str>,
+    mode: IconPick,
+    size: usize,
+) -> Result<(), String> {
+    if matches!(mode, IconPick::Template) {
+        let old_size = package
+            .and_then(|package| {
+                state
+                    .quickapps
+                    .iter()
+                    .find(|entry| entry.declaration.package == package)
+            })
+            .and_then(|entry| entry.template.as_ref())
+            .map_or(0, |bytes| bytes.len());
+        validate_icon_budget(size, template_bytes(state), old_size, true)
+    } else {
+        let old_size = replacement_sizes_by_destination(state)
+            .get(icon_destination(state, package))
+            .copied()
+            .unwrap_or(0);
+        validate_icon_budget(size, replacement_bytes(state), old_size, false)
+    }
+}
+
+fn set_shared_icon_asset(
+    state: &mut UiState,
+    destination: &str,
+    bytes: Vec<u8>,
+    create_canopus: bool,
+) {
+    let asset = IconAsset::new(bytes);
+    for entry in &mut state.quickapps {
+        if entry.declaration.destination == destination {
+            entry.asset = Some(asset.clone());
+        }
+    }
+    if state.canopus_destination == destination && (create_canopus || state.canopus.is_some()) {
+        state.canopus = Some(asset.clone());
+    }
+    if let Some(firmware_bytes) = state.replacements.get_mut(destination) {
+        *firmware_bytes = asset.bytes.as_ref().clone();
+        state.thumbnail_cache.remove(destination);
+    }
+}
+
+fn set_resource_replacement(state: &mut UiState, path: &str, bytes: Vec<u8>) {
+    if icon_destinations(state).contains(path) {
+        set_shared_icon_asset(state, path, bytes, false);
+    } else {
+        state.replacements.insert(path.to_string(), bytes);
+    }
+}
+
+async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
+    let (template, allow_quantize) = {
+        let mut state = lock_state();
+        if state.busy {
+            return;
+        }
+        let template = if let Some(package) = package {
+            let Some(entry) = state
+                .quickapps
+                .iter()
+                .find(|entry| entry.declaration.package == package)
+            else {
+                return;
+            };
+            if matches!(mode, IconPick::Png) && entry.template.is_none() {
+                state.error =
+                    Some("请先上传此快应用的原始 LVGL BIN 模板，或直接用 BIN 替换。".into());
+                drop(state);
+                render_current();
+                return;
+            }
+            if matches!(mode, IconPick::Png) {
+                entry.template.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        state.busy = true;
+        state.error = None;
+        state.status = match mode {
+            IconPick::Png => "等待选择图标 PNG…",
+            IconPick::Binary => "等待选择 LVGL 图标 BIN…",
+            IconPick::Template => "等待选择原始 LVGL BIN 模板（仅用于转换，不导出）…",
+        }
+        .into();
+        (template, state.allow_quantize)
+    };
+    render_current();
+    let picked = psys_host::dialog::pick_file(
+        psys_host::dialog::PickConfig {
+            read: true,
+            copy_to: None,
+        },
+        psys_host::dialog::FilterConfig {
+            multiple: false,
+            extensions: vec![
+                if matches!(mode, IconPick::Png) {
+                    "png"
+                } else {
+                    "bin"
+                }
+                .into(),
+            ],
+            default_directory: String::new(),
+            default_file_name: String::new(),
+        },
+    )
+    .await;
+    let result = match picked {
+        Ok(picked) if picked.data.is_empty() => Ok(None),
+        Ok(picked) => {
+            // The host already owns the selected bytes; bound them before decode/encode
+            // can allocate or clone even when a tiny valid header has huge trailing data.
+            let preflight = validate_icon_input(&lock_state(), package, mode, picked.data.len());
+            preflight
+                .and_then(|()| {
+                    if matches!(mode, IconPick::Template) {
+                        app_icons::inspect_bin(&picked.data)?;
+                        Ok(picked.data)
+                    } else {
+                        app_icons::encode(
+                            &picked.data,
+                            template.as_ref().map(|bytes| bytes.as_slice()),
+                            package.is_none(),
+                            matches!(mode, IconPick::Binary),
+                            allow_quantize,
+                        )
+                    }
+                })
+                .map(Some)
+        }
+        Err(error) => Err(format!("选择图标失败：{error}")),
+    };
+    let mut state = lock_state();
+    state.busy = false;
+    match result {
+        Ok(Some(bytes)) => {
+            if let Err(error) = validate_icon_update(&state, package, mode, bytes.len()) {
+                state.status = "图标未更改。".into();
+                state.error = Some(error);
+            } else {
+                let size = bytes.len();
+                if matches!(mode, IconPick::Template) {
+                    if let Some(entry) = state
+                        .quickapps
+                        .iter_mut()
+                        .find(|entry| Some(entry.declaration.package.as_str()) == package)
+                    {
+                        entry.template = Some(Arc::new(bytes));
+                    }
+                } else {
+                    let destination = icon_destination(&state, package).to_string();
+                    set_shared_icon_asset(&mut state, &destination, bytes, package.is_none());
+                }
+                state.status = if matches!(mode, IconPick::Template) {
+                    format!(
+                        "已加载原始 BIN 模板（{}）；模板不计入替换项，也不会单独导出。",
+                        format_bytes(size)
+                    )
+                } else {
+                    format!(
+                        "已替换第三方应用图标（{}）；仅在导出 CRPack 时合并，不会操作设备。",
+                        format_bytes(size)
+                    )
+                };
+                state.error = None;
+            }
+        }
+        Ok(None) => state.status = "未选择图标文件；现有编辑保持不变。".into(),
+        Err(error) => {
+            state.status = "图标未更改。".into();
+            state.error = Some(error);
+        }
+    }
+    drop(state);
+    render_current();
 }
 
 async fn begin_png_pick() {
@@ -805,8 +1493,11 @@ async fn begin_png_pick() {
         let format_name = lvgl::inspect_image(template.as_slice())
             .map(|info| info.format.display_name())
             .unwrap_or("目标格式");
-        let result =
-            lvgl::encode_png_to_template_detailed(&picked.data, template.as_slice(), allow_quantize);
+        let result = lvgl::encode_png_to_template_detailed(
+            &picked.data,
+            template.as_slice(),
+            allow_quantize,
+        );
         match result {
             Ok(encoded) => {
                 let size = encoded.bytes.len();
@@ -817,7 +1508,7 @@ async fn begin_png_pick() {
                 };
                 let (preview_uri, preview_error) = preview_from_bytes(&encoded.bytes);
                 let mut state = lock_state();
-                state.replacements.insert(path.clone(), encoded.bytes);
+                set_resource_replacement(&mut state, &path, encoded.bytes);
                 state.thumbnail_cache.remove(&path);
                 state.selected_path = Some(path.clone());
                 state.preview_uri = preview_uri;
@@ -892,11 +1583,7 @@ async fn begin_binary_pick() {
     if !picked.name.is_empty() {
         let mut state = lock_state();
         let picked_size = picked.data.len();
-        let new_total = state
-            .replacements
-            .values()
-            .map(Vec::len)
-            .sum::<usize>()
+        let new_total = replacement_bytes(&state)
             .saturating_sub(state.replacements.get(&path).map_or(0, Vec::len))
             .saturating_add(picked_size);
         if new_total > 64 * 1024 * 1024 {
@@ -905,7 +1592,7 @@ async fn begin_binary_pick() {
             state.error = Some("替换资源总大小不能超过 CRPack v1 的 64 MiB 上限。".into());
         } else {
             let (preview_uri, preview_error) = preview_from_bytes(&picked.data);
-            state.replacements.insert(path.clone(), picked.data);
+            set_resource_replacement(&mut state, &path, picked.data);
             state.thumbnail_cache.remove(&path);
             state.selected_path = Some(path);
             state.preview_uri = preview_uri;
@@ -1020,8 +1707,8 @@ async fn begin_export() {
         if state.busy {
             return;
         }
-        if state.replacements.is_empty() {
-            state.error = Some("请先替换至少一个固件资源。".into());
+        if replacement_count(&state) == 0 {
+            state.error = Some("请先替换至少一个资源或第三方应用图标。".into());
             drop(state);
             render_current();
             return;
@@ -1034,15 +1721,7 @@ async fn begin_export() {
 
     let package = {
         let state = lock_state();
-        crpack::build_crpack(&PackOptions {
-            theme_id: &state.theme_id,
-            name: &state.pack_name,
-            version: (!state.version.is_empty()).then_some(state.version.as_str()),
-            author: (!state.author.is_empty()).then_some(state.author.as_str()),
-            description: (!state.description.is_empty()).then_some(state.description.as_str()),
-            target: (!state.target.is_empty()).then_some(state.target.as_str()),
-            replacements: &state.replacements,
-        })
+        build_project_pack(&state)
     };
 
     let package = match package {
@@ -1410,7 +2089,14 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
                 "选择官方 OTA 固件，插件会解包 vela_resource.bin 并建立只读资源树。替换项保留原始路径，完成后只导出修改过的文件。",
                 14,
             ))
-            .child(button("选择手环固件", "firmware.upload", "solid", "accent"));
+            .child(button("选择手环固件", "firmware.upload", "solid", "accent").disabled_if(state.busy))
+            .child(text("第三方应用图标无需固件。导入 CRPack 会覆盖当前编辑；更换固件仅重置固件资源替换，保留第三方图标。", 12))
+            .child(
+                ui::Element::new(ui::ElementType::Div, None).flex().gap(8)
+                    .child(button("导入 .crpack", "pack.import", "soft", "gray").disabled_if(state.busy))
+                    .child(button("导出 .crpack", "pack.export", "solid", "accent").disabled_if(state.busy || state.replacement_count == 0))
+                    .child(badge(&format!("已替换 {}（第三方图标 {}）", state.replacement_count, state.icon_replacement_count), "accent")),
+            );
         root = root.child(empty);
     } else {
         let upload = button(
@@ -1475,14 +2161,14 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
                     .gap(6)
                     .flex_grow(1.0)
                     .child(span("📦", 14))
-                    .child(
-                        span(&display_name, 14)
-                            .prop("title", &state.firmware_name),
-                    ),
+                    .child(span(&display_name, 14).prop("title", &state.firmware_name)),
             )
             .child(badge(&format!("{} 个文件", state.file_count), "gray"))
             .child(badge(
-                &format!("已替换 {}", state.replacement_count),
+                &format!(
+                    "已替换 {}（图标 {}）",
+                    state.replacement_count, state.icon_replacement_count
+                ),
                 if state.replacement_count > 0 {
                     "accent"
                 } else {
@@ -1496,7 +2182,11 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
             .width_full()
             .gap(8)
             .child(summary)
-            .child(actions);
+            .child(actions)
+            .child(text(
+                "导入 CRPack 会覆盖当前编辑；更换固件仅重置固件资源替换，保留第三方图标。",
+                12,
+            ));
 
         root = root.child(toolbar);
 
@@ -1511,7 +2201,153 @@ fn build_main_ui(state: UiSnapshot) -> ui::Element {
         root = root.child(workspace);
     }
 
+    root = root.child(build_app_icons(&state));
+    if state.firmware_name.is_empty() {
+        root = root.child(build_inspector(&state));
+    }
     root.child(build_status(&state))
+}
+
+fn build_app_icons(state: &UiSnapshot) -> ui::Element {
+    let mut icons = ui::Element::new(ui::ElementType::Grid, None)
+        .grid_template_columns("repeat(auto-fit, minmax(min(100%, 280px), 1fr))")
+        .width_full()
+        .gap(10)
+        .child(build_icon_card(&state.canopus, true, state.busy));
+    for icon in &state.quickapps {
+        icons = icons.child(build_icon_card(icon, false, state.busy));
+    }
+    let add = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Row)
+        .align_end()
+        .width_full()
+        .gap(8)
+        .child(
+            field(
+                "快应用标识（原样保留）",
+                &state.quickapp_package,
+                "icons.quickapp.package",
+                "任意标识，可为空；空格不裁剪",
+            )
+            .flex_grow(1.0),
+        )
+        .child(button("添加", "icons.quickapp.add", "soft", "accent").disabled_if(state.busy));
+    let quantize = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .align_center()
+        .gap(8)
+        .child(
+            ui::Element::new(ui::ElementType::Checkbox, None)
+                .prop(
+                    "checked",
+                    if state.allow_quantize {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .prop("size", "2")
+                .on(ui::Event::Change, "pack.quantize")
+                .disabled_if(state.busy),
+        )
+        .child(text("允许调色板颜色超限时进行有损量化（PNG 转换）", 13));
+    ui::Element::new(ui::ElementType::Card, None)
+        .prop("variant", "surface").prop("size", "2").radius(24).padding(14)
+        .flex().flex_direction(ui::FlexDirection::Column).align_start().gap(10)
+        .child(text("第三方应用图标", 17))
+        .child(text("无需加载固件。Canopus 使用 117×117 LVGL v9 ARGB8888 预设；快应用 PNG 需要原始 BIN 模板，BIN 替换仅接受有效 LVGL 图像。", 13))
+        .child(text("注意：Canopus 预设仅适用于已知的 LVGL v9 117×117 ARGB8888 布局，不适用于 v8 或其他布局；其他设备/固件请确认原始格式，并直接使用匹配的 LVGL BIN。", 12))
+        .child(text("设备支持目前限小米手环 11 的 4.100.139 / 4.100.155，需新版资源替换模块支持。此处仅编辑并导出 CRPack，不会立即操作设备。", 12))
+        .child(text("快应用标识原样保留（含空格、斜杠或空值）；加上 @quickapp-icon/ 后最多 255 UTF-8 字节，不能含字节 0–31 或 127。", 12))
+        .child(add).child(quantize).child(icons)
+}
+
+fn build_icon_card(icon: &IconSnapshot, canopus: bool, busy: bool) -> ui::Element {
+    let event = |action: &str| {
+        if canopus {
+            format!("icons.canopus.{action}")
+        } else {
+            format!("icons.quickapp.{action}:{}", icon.name)
+        }
+    };
+    let mut content = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .width_full()
+        .gap(8)
+        .child(text(&icon.name, 15))
+        .child(text(&icon.destination, 12));
+    if let Some(info) = icon.template_info {
+        content = content.child(text(
+            &format!(
+                "{}：{}×{} {}{}",
+                if canopus { "预设" } else { "原始模板" },
+                info.width,
+                info.height,
+                info.format.display_name(),
+                if canopus { "" } else { "（仅转换用）" },
+            ),
+            12,
+        ));
+    } else if !canopus {
+        content = content.child(text("未加载原始 BIN 模板；可直接替换 BIN。", 12));
+    }
+    let preview = ui::Element::new(ui::ElementType::Div, None)
+        .width_full()
+        .height(140)
+        .flex()
+        .justify_center()
+        .align_center();
+    content = content.child(if let Some(uri) = &icon.preview_uri {
+        preview.child(
+            ui::Element::new(ui::ElementType::Image, Some(uri))
+                .max_width(132)
+                .max_height(132)
+                .prop("alt", &icon.name)
+                .prop("draggable", "false"),
+        )
+    } else {
+        preview.child(text(
+            if icon.size.is_some() {
+                "此图标暂不可预览。"
+            } else {
+                "尚未替换图标"
+            },
+            13,
+        ))
+    });
+    if let Some(size) = icon.size {
+        content = content.child(badge(&format!("已替换 · {}", format_bytes(size)), "accent"));
+    }
+    let mut actions = ui::Element::new(ui::ElementType::Grid, None)
+        .grid_template_columns("repeat(2, 1fr)")
+        .width_full()
+        .gap(8)
+        .child(
+            button("用 PNG 替换", &event("png"), "soft", "accent")
+                .disabled_if(busy || (!canopus && icon.template_info.is_none())),
+        )
+        .child(button("用 BIN 替换", &event("bin"), "soft", "gray").disabled_if(busy));
+    if canopus {
+        actions = actions.child(
+            button("撤销替换", &event("undo"), "ghost", "gray")
+                .disabled_if(busy || icon.size.is_none()),
+        );
+    } else {
+        actions = actions
+            .child(
+                button("上传原始 BIN 模板", &event("template"), "soft", "gray").disabled_if(busy),
+            )
+            .child(button("移除", &event("remove"), "ghost", "gray").disabled_if(busy));
+    }
+    content = content.child(actions);
+    ui::Element::new(ui::ElementType::Card, None)
+        .prop("variant", "surface")
+        .prop("size", "1")
+        .radius(12)
+        .padding(12)
+        .child(content)
 }
 
 fn build_browser(state: &UiSnapshot) -> ui::Element {
@@ -1558,16 +2394,18 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
         )
         .child(
             button(
-                &format!("已替换 {}", state.replacement_count),
+                &format!("已替换 {}", state.firmware_replacement_count),
                 "browser.filter:replaced",
                 if state.filter_mode == ResourceFilter::Replaced {
                     "solid"
-                } else if state.replacement_count > 0 {
+                } else if state.firmware_replacement_count > 0 {
                     "soft"
                 } else {
                     "ghost"
                 },
-                if state.filter_mode == ResourceFilter::Replaced || state.replacement_count > 0 {
+                if state.filter_mode == ResourceFilter::Replaced
+                    || state.firmware_replacement_count > 0
+                {
                     "accent"
                 } else {
                     "gray"
@@ -1603,16 +2441,11 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
         .align_center()
         .gap(6)
         .child(search)
-        .child(
-            button("筛选", "browser.apply-search", "soft", "gray")
-                .disabled_if(state.busy),
-        );
+        .child(button("筛选", "browser.apply-search", "soft", "gray").disabled_if(state.busy));
 
     if !state.search_query.trim().is_empty() {
-        search_row = search_row.child(
-            button("清空", "browser.clear-search", "ghost", "gray")
-                .disabled_if(state.busy),
-        );
+        search_row = search_row
+            .child(button("清空", "browser.clear-search", "ghost", "gray").disabled_if(state.busy));
     }
 
     let mut list = ui::Element::new(ui::ElementType::ScrollArea, None)
@@ -1645,8 +2478,8 @@ fn build_browser(state: &UiSnapshot) -> ui::Element {
                 .child(text(empty_tip, 13)),
         );
     } else {
-        let show_full_path = !state.search_query.is_empty()
-            || state.filter_mode == ResourceFilter::Replaced;
+        let show_full_path =
+            !state.search_query.is_empty() || state.filter_mode == ResourceFilter::Replaced;
         for entry in &state.entries {
             let row = if entry.is_directory {
                 build_directory_row(entry, state.busy)
@@ -1723,7 +2556,10 @@ fn build_breadcrumbs(state: &UiSnapshot) -> ui::Element {
                     .flex_grow(1.0)
                     .child(span("✏️", 13))
                     .child(span("全部已修改资源清单", 13))
-                    .child(badge(&format!("{} 项", state.replacement_count), "accent")),
+                    .child(badge(
+                        &format!("{} 项", state.firmware_replacement_count),
+                        "accent",
+                    )),
             )
             .child(
                 button("返回目录浏览", "browser.filter:all", "ghost", "gray")
@@ -1747,7 +2583,10 @@ fn build_breadcrumbs(state: &UiSnapshot) -> ui::Element {
                     .gap(6)
                     .flex_grow(1.0)
                     .child(span("🔍", 13))
-                    .child(span(&format!("搜索: \"{}\"", state.search_query.trim()), 13))
+                    .child(span(
+                        &format!("搜索: \"{}\"", state.search_query.trim()),
+                        13,
+                    ))
                     .child(badge(&format!("{} 项", state.entries.len()), "gray")),
             )
             .child(
@@ -1975,7 +2814,14 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
         .flex_direction(ui::FlexDirection::Column)
         .width_full()
         .gap(10)
-        .child(text("预览与替换", 17));
+        .child(text(
+            if state.firmware_name.is_empty() {
+                "资源包信息"
+            } else {
+                "预览与替换"
+            },
+            17,
+        ));
 
     if let Some(path) = state.selected_path.as_deref() {
         let image_info = state.selected_image;
@@ -2000,7 +2846,12 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
                     image_info
                         .map(|info| {
                             if info.width > 0 && info.height > 0 {
-                                format!(" · {}×{} {}", info.width, info.height, info.format.display_name())
+                                format!(
+                                    " · {}×{} {}",
+                                    info.width,
+                                    info.height,
+                                    info.format.display_name()
+                                )
                             } else {
                                 format!(" · {}", info.format.display_name())
                             }
@@ -2091,12 +2942,14 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
                 button("恢复固件原文件", "replace.restore", "soft", "gray").disabled_if(state.busy),
             );
         }
-    } else {
+    } else if !state.firmware_name.is_empty() {
         content = content.child(text("选择左侧文件；图片资源会显示预览。", 14));
     }
 
-    content = content.child(ui::Element::new(ui::ElementType::Separator, None));
-    content = content.child(text("资源包信息", 15));
+    if !state.firmware_name.is_empty() {
+        content = content.child(ui::Element::new(ui::ElementType::Separator, None));
+        content = content.child(text("资源包信息", 15));
+    }
     let metadata = ui::Element::new(ui::ElementType::Grid, None)
         .grid_template_columns("repeat(auto-fit, minmax(min(100%, 180px), 1fr))")
         .gap(8)
@@ -2224,6 +3077,495 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entered_quickapp_identifiers_are_never_trimmed_or_interpreted_as_paths() {
+        let mut state = UiState::default();
+        for package in ["", " ", " 快应用/ ", "../", r"a:b\c", "a..b", "a\u{0085}"] {
+            state.quickapp_package = package.into();
+            insert_quickapp(&mut state).unwrap();
+            let entry = state.quickapps.last_mut().unwrap();
+            assert_eq!(entry.declaration.package, package);
+            assert_eq!(
+                entry.declaration.destination,
+                app_icons::destination(package)
+            );
+            entry.asset = Some(IconAsset::new(app_icons::canopus_template()));
+        }
+        let bytes = build_project_pack(&state).unwrap();
+        let imported = parse_ui_pack(&bytes).unwrap();
+        assert_eq!(imported.quickapp_icons.len(), state.quickapps.len());
+        for (icon, entry) in imported.quickapp_icons.iter().zip(&state.quickapps) {
+            assert_eq!(icon, &entry.declaration);
+        }
+    }
+
+    fn quickapp(package: &str, with_asset: bool) -> QuickappEntry {
+        let bytes = app_icons::canopus_template();
+        QuickappEntry {
+            declaration: QuickappIcon {
+                package: package.into(),
+                destination: app_icons::destination(package),
+            },
+            template: Some(Arc::new(bytes.clone())),
+            asset: with_asset.then(|| IconAsset::new(bytes)),
+        }
+    }
+
+    #[test]
+    fn standalone_app_icons_count_and_export_without_firmware() {
+        let mut state = UiState {
+            canopus: Some(IconAsset::new(app_icons::canopus_template())),
+            quickapps: vec![quickapp("ng.example.app", true)],
+            ..UiState::default()
+        };
+        assert!(state.firmware.is_none());
+        assert!(state.replacements.is_empty());
+        let snap = snapshot(&mut state);
+        assert_eq!(snap.replacement_count, 2);
+        assert_eq!(snap.firmware_replacement_count, 0);
+        assert!(snap.canopus.preview_uri.is_some());
+        assert!(snap.quickapps[0].preview_uri.is_some());
+        let unpacked = crpack::parse_crpack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(unpacked.replacements.len(), 2);
+        assert_eq!(unpacked.quickapp_icons.len(), 1);
+        assert_eq!(
+            unpacked.mappings,
+            vec![Mapping {
+                source: app_icons::CANOPUS_SOURCE.into(),
+                destination: app_icons::CANOPUS_DESTINATION.into(),
+            }]
+        );
+        assert_eq!(unpacked.quickapp_icons[0].package, "ng.example.app");
+    }
+
+    #[test]
+    fn header_snapshots_and_import_confirmation_include_icon_edits() {
+        let mut state = UiState {
+            canopus: Some(IconAsset::new(app_icons::canopus_template())),
+            quickapps: vec![quickapp("ng.example.app", true)],
+            ..UiState::default()
+        };
+        assert!(import_confirmation(&state).contains("共 2 项替换（固件资源 0，第三方图标 2）"));
+        // Host UI Elements require AstroBox; exercise the pure snapshots feeding both headers.
+        let empty = snapshot(&mut state);
+        assert_eq!(empty.replacement_count, 2);
+        assert_eq!(empty.icon_replacement_count, 2);
+        state.firmware_name = "firmware.bin".into();
+        let loaded = snapshot(&mut state);
+        assert_eq!(loaded.replacement_count, 2);
+        assert_eq!(loaded.icon_replacement_count, 2);
+    }
+
+    #[test]
+    fn unsupported_non_resource_mappings_are_rejected_not_dropped() {
+        let replacements = BTreeMap::from([("custom.bin".into(), vec![1, 2, 3])]);
+        let mapping = Mapping {
+            source: "/data/custom/icon.bin".into(),
+            destination: "custom.bin".into(),
+        };
+        let package = crpack::build_crpack_with_icons(
+            &PackOptions {
+                theme_id: "conora",
+                name: "Custom",
+                version: None,
+                author: None,
+                description: None,
+                target: None,
+                replacements: &replacements,
+            },
+            std::slice::from_ref(&mapping),
+            &[],
+        )
+        .unwrap();
+        assert!(crpack::parse_crpack(&package).is_ok());
+        let error = parse_ui_pack(&package).unwrap_err();
+        assert!(error.contains(&mapping.source));
+        assert!(error.contains("不支持映射来源"));
+        let mut state = UiState::default();
+        state.mappings.push(mapping);
+        // Even a rule with no surviving destination must error, rather than be filtered out.
+        assert!(
+            export_assets(&state)
+                .unwrap_err()
+                .contains("不支持映射来源")
+        );
+    }
+
+    #[test]
+    fn templates_are_not_replacements_and_incomplete_declarations_cannot_export() {
+        let mut state = UiState::default();
+        state.quickapps.push(quickapp("ng.example.app", false));
+        assert_eq!(replacement_count(&state), 0);
+        assert_eq!(replacement_bytes(&state), 0);
+        assert!(
+            build_project_pack(&state)
+                .unwrap_err()
+                .contains("尚未替换图标")
+        );
+        state.quickapps.clear();
+        assert!(export_assets(&state).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn imported_app_declarations_and_custom_canopus_mapping_round_trip() {
+        let mut state = UiState::default();
+        let bytes = app_icons::canopus_template();
+        let canopus = Mapping {
+            source: app_icons::CANOPUS_SOURCE.into(),
+            destination: "custom/manager.bin".into(),
+        };
+        let declaration = QuickappIcon {
+            package: "ng.example.app".into(),
+            destination: "custom/quick.bin".into(),
+        };
+        import_assets(
+            &mut state,
+            BTreeMap::from([
+                (canopus.destination.clone(), bytes.clone()),
+                (declaration.destination.clone(), bytes.clone()),
+                ("image.bin".into(), bytes),
+            ]),
+            vec![
+                canopus.clone(),
+                Mapping {
+                    source: "/resource/image.bin".into(),
+                    destination: "image.bin".into(),
+                },
+            ],
+            vec![declaration.clone()],
+        );
+        assert_eq!(state.replacements.len(), 1);
+        assert_eq!(replacement_count(&state), 3);
+        assert!(state.quickapps[0].template.is_some());
+        let unpacked = crpack::parse_crpack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(unpacked.quickapp_icons, vec![declaration]);
+        assert!(unpacked.mappings.contains(&canopus));
+        assert!(
+            unpacked
+                .mappings
+                .iter()
+                .any(|mapping| mapping.source == "/resource/image.bin")
+        );
+        assert!(
+            !unpacked
+                .mappings
+                .iter()
+                .any(|mapping| mapping.source == "/resource/custom/quick.bin")
+        );
+    }
+
+    #[test]
+    fn canonical_quickapp_mapping_import_normalizes_once() {
+        let mut state = UiState::default();
+        let declaration = QuickappIcon {
+            package: "ng.example.app".into(),
+            destination: "icons/example.bin".into(),
+        };
+        import_assets(
+            &mut state,
+            BTreeMap::from([(
+                declaration.destination.clone(),
+                app_icons::canopus_template(),
+            )]),
+            vec![Mapping {
+                source: format!("@quickapp-icon/{}", declaration.package),
+                destination: declaration.destination.clone(),
+            }],
+            vec![declaration.clone()],
+        );
+        assert_eq!(state.quickapps.len(), 1);
+        assert!(state.mappings.is_empty());
+        assert!(state.replacements.is_empty());
+        let unpacked = crpack::parse_crpack(&build_project_pack(&state).unwrap()).unwrap();
+        assert!(unpacked.mappings.is_empty());
+        assert_eq!(unpacked.quickapp_icons, vec![declaration]);
+    }
+
+    #[test]
+    fn mapping_only_quickapp_pack_becomes_one_declaration_on_import() {
+        let declaration = QuickappIcon {
+            package: "ng.example.app".into(),
+            destination: "icons/example.bin".into(),
+        };
+        let replacements = BTreeMap::from([(
+            declaration.destination.clone(),
+            app_icons::canopus_template(),
+        )]);
+        let package = crpack::build_crpack_with_icons(
+            &PackOptions {
+                theme_id: "conora",
+                name: "Icons",
+                version: None,
+                author: None,
+                description: None,
+                target: None,
+                replacements: &replacements,
+            },
+            &[Mapping {
+                source: format!("@quickapp-icon/{}", declaration.package),
+                destination: declaration.destination.clone(),
+            }],
+            &[],
+        )
+        .unwrap();
+        let unpacked = crpack::parse_crpack(&package).unwrap();
+        let mut state = UiState::default();
+        import_assets(
+            &mut state,
+            unpacked.replacements,
+            unpacked.mappings,
+            unpacked.quickapp_icons,
+        );
+        assert_eq!(state.quickapps.len(), 1);
+        assert_eq!(replacement_count(&state), 1);
+        let unpacked = crpack::parse_crpack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(unpacked.quickapp_icons, vec![declaration]);
+        assert!(unpacked.mappings.is_empty());
+    }
+
+    #[test]
+    fn firmware_workspace_reset_retains_icon_assets_templates_and_mappings() {
+        let mut state = UiState::default();
+        let bytes = app_icons::canopus_template();
+        state.replacements.insert("image.bin".into(), bytes.clone());
+        state.canopus = Some(IconAsset::new(bytes));
+        state.quickapps.push(quickapp("ng.example.app", true));
+        state.mappings.push(Mapping {
+            source: app_icons::CANOPUS_SOURCE.into(),
+            destination: state.canopus_destination.clone(),
+        });
+        reset_firmware_resource_edits(&mut state);
+        assert!(state.replacements.is_empty());
+        assert_eq!(replacement_count(&state), 2);
+        assert!(state.quickapps[0].template.is_some());
+        assert_eq!(state.mappings.len(), 1);
+        assert!(build_project_pack(&state).is_ok());
+    }
+
+    #[test]
+    fn shared_app_destinations_clone_once_and_export_all_declarations() {
+        let mut state = UiState::default();
+        let bytes = app_icons::canopus_template();
+        let destination = "shared/icon.bin".to_string();
+        let canopus = Mapping {
+            source: app_icons::CANOPUS_SOURCE.into(),
+            destination: destination.clone(),
+        };
+        let declarations = ["ng.example.one", "ng.example.two"]
+            .map(|package| QuickappIcon {
+                package: package.into(),
+                destination: destination.clone(),
+            })
+            .to_vec();
+        import_assets(
+            &mut state,
+            BTreeMap::from([(destination.clone(), bytes.clone())]),
+            vec![canopus.clone()],
+            declarations.clone(),
+        );
+        assert!(state.replacements.is_empty());
+        assert_eq!(replacement_count(&state), 1);
+        assert_eq!(replacement_bytes(&state), bytes.len());
+        assert_eq!(icon_replacement_count(&state), 1);
+        let first = state.quickapps[0].asset.as_ref().unwrap();
+        let second = state.quickapps[1].asset.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
+        assert!(Arc::ptr_eq(
+            &first.bytes,
+            &state.canopus.as_ref().unwrap().bytes
+        ));
+        let unpacked = parse_ui_pack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(unpacked.replacements.len(), 1);
+        assert_eq!(unpacked.quickapp_icons, declarations);
+        assert_eq!(unpacked.mappings, vec![canopus]);
+    }
+
+    #[test]
+    fn shared_application_file_backed_by_firmware_mapping_is_preserved_and_updated() {
+        let mut state = UiState::default();
+        let bytes = app_icons::canopus_template();
+        let destination = "shared.bin".to_string();
+        let mappings = vec![
+            Mapping {
+                source: "/resource/original.bin".into(),
+                destination: destination.clone(),
+            },
+            Mapping {
+                source: app_icons::CANOPUS_SOURCE.into(),
+                destination: destination.clone(),
+            },
+        ];
+        import_assets(
+            &mut state,
+            BTreeMap::from([(destination.clone(), bytes)]),
+            mappings.clone(),
+            vec![QuickappIcon {
+                package: "ng.example.app".into(),
+                destination: destination.clone(),
+            }],
+        );
+        assert!(state.replacements.contains_key(&destination));
+        assert_eq!(replacement_count(&state), 1);
+        let snap = snapshot(&mut state);
+        assert_eq!(snap.replacement_count, 1);
+        assert_eq!(snap.firmware_replacement_count, 1);
+        assert_eq!(snap.icon_replacement_count, 1);
+        let mut edited = app_icons::canopus_template();
+        edited[12] = 255;
+        set_shared_icon_asset(&mut state, &destination, edited.clone(), false);
+        assert_eq!(state.replacements[&destination], edited);
+        assert_eq!(
+            state.quickapps[0].asset.as_ref().unwrap().bytes.as_slice(),
+            edited
+        );
+        let unpacked = parse_ui_pack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(unpacked.replacements.len(), 1);
+        assert_eq!(unpacked.mappings, mappings);
+        assert_eq!(unpacked.replacements[&destination], edited);
+    }
+
+    #[test]
+    fn unused_imported_files_remain_unmapped_even_with_new_sibling_replacements() {
+        let mut state = UiState::default();
+        let mapped = Mapping {
+            source: "/resource/original.bin".into(),
+            destination: "icons/mapped.bin".into(),
+        };
+        import_assets(
+            &mut state,
+            BTreeMap::from([
+                ("icons/unused.bin".into(), vec![1]),
+                ("icons/mapped.bin".into(), vec![2]),
+            ]),
+            vec![mapped.clone()],
+            vec![],
+        );
+        let unchanged = parse_ui_pack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(unchanged.mappings, vec![mapped.clone()]);
+        assert_eq!(unchanged.replacements.len(), 2);
+        state.replacements.insert("icons/a.bin".into(), vec![3]);
+        state.replacements.insert("icons/b.bin".into(), vec![4]);
+        let edited = parse_ui_pack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(edited.replacements.len(), 4);
+        assert!(edited.mappings.contains(&mapped));
+        assert_eq!(edited.mappings.len(), 3);
+        assert!(
+            edited
+                .mappings
+                .iter()
+                .any(|mapping| mapping.source == "/resource/icons/a.bin")
+        );
+        assert!(
+            edited
+                .mappings
+                .iter()
+                .any(|mapping| mapping.source == "/resource/icons/b.bin")
+        );
+        assert!(
+            !edited
+                .mappings
+                .iter()
+                .any(|mapping| mapping_covers(mapping, "icons/unused.bin"))
+        );
+    }
+
+    #[test]
+    fn firmware_load_clears_stale_imported_resource_rules_before_new_edits() {
+        let mut state = UiState::default();
+        let canopus = Mapping {
+            source: app_icons::CANOPUS_SOURCE.into(),
+            destination: "canopus.bin".into(),
+        };
+        import_assets(
+            &mut state,
+            BTreeMap::from([
+                ("image.bin".into(), vec![1]),
+                ("canopus.bin".into(), app_icons::canopus_template()),
+            ]),
+            vec![
+                Mapping {
+                    source: "/resource/stale.bin".into(),
+                    destination: "image.bin".into(),
+                },
+                canopus.clone(),
+            ],
+            vec![],
+        );
+        reset_firmware_resource_edits(&mut state);
+        assert_eq!(state.mappings, vec![canopus.clone()]);
+        assert!(state.imported_paths.is_empty());
+        state.replacements.insert("image.bin".into(), vec![2]);
+        let unpacked = parse_ui_pack(&build_project_pack(&state).unwrap()).unwrap();
+        assert!(unpacked.mappings.contains(&canopus));
+        assert!(
+            unpacked
+                .mappings
+                .iter()
+                .any(|mapping| mapping.source == "/resource/image.bin")
+        );
+        assert!(
+            !unpacked
+                .mappings
+                .iter()
+                .any(|mapping| mapping.source == "/resource/stale.bin")
+        );
+    }
+
+    #[test]
+    fn icon_input_size_is_rejected_before_decoding_valid_bin_with_oversized_tail() {
+        let state = UiState::default();
+        let mut input = app_icons::canopus_template();
+        input.resize(MAX_ICON_BYTES + 1, 0);
+        assert!(
+            validate_icon_input(&state, None, IconPick::Binary, input.len())
+                .unwrap_err()
+                .contains("单个图标上传")
+        );
+        assert!(validate_icon_input(&state, None, IconPick::Png, input.len()).is_err());
+        assert!(validate_icon_input(&state, None, IconPick::Template, input.len()).is_err());
+    }
+
+    #[test]
+    fn template_and_replacement_budgets_are_independent_and_subtract_previous_size() {
+        let mut state = UiState {
+            quickapps: vec![
+                quickapp("ng.example.one", false),
+                quickapp("ng.example.two", false),
+            ],
+            canopus: Some(IconAsset::new(vec![0; 8])),
+            ..UiState::default()
+        };
+        // Small payloads make the arithmetic boundary test cheap; format validation occurs
+        // only after this preflight in the upload path.
+        state.quickapps[0].template = Some(Arc::new(vec![0; 32]));
+        state.quickapps[1].template = Some(Arc::new(vec![0; 64]));
+        state.replacements.insert("resource.bin".into(), vec![0; 4]);
+        assert_eq!(template_bytes(&state), 96);
+        assert_eq!(replacement_bytes(&state), 12);
+        assert!(
+            validate_icon_update(
+                &state,
+                Some("ng.example.one"),
+                IconPick::Template,
+                MAX_ICON_BYTES - 64
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_icon_update(
+                &state,
+                Some("ng.example.one"),
+                IconPick::Template,
+                MAX_ICON_BYTES - 63
+            )
+            .unwrap_err()
+            .contains("模板总大小")
+        );
+        assert!(validate_icon_update(&state, None, IconPick::Binary, MAX_ICON_BYTES - 4).is_ok());
+        assert!(validate_icon_update(&state, None, IconPick::Binary, MAX_ICON_BYTES - 3).is_err());
+        assert!(validate_icon_input(&state, None, IconPick::Png, MAX_ICON_BYTES).is_ok());
+    }
+
+    #[test]
     fn extracted_names_use_the_resource_leaf_and_png_extension() {
         assert_eq!(resource_file_name("app/icons/confirm.bin"), "confirm.bin");
         assert_eq!(png_file_name("confirm.bin"), "confirm.png");
@@ -2243,6 +3585,9 @@ mod tests {
         assert_eq!(format_firmware_name(exact_28), exact_28);
 
         let long_name = "miwear.watch.p67tc_v3.101.043_full_a4ce8564.bin";
-        assert_eq!(format_firmware_name(long_name), "miwear.watch.p…a4ce8564.bin");
+        assert_eq!(
+            format_firmware_name(long_name),
+            "miwear.watch.p…a4ce8564.bin"
+        );
     }
 }

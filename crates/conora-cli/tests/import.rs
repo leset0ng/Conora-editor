@@ -663,3 +663,231 @@ fn import_progress_is_throttled_and_does_not_corrupt_json_stdout() {
         5
     );
 }
+
+#[test]
+fn native_only_and_mixed_pack_import_preserves_canopus_and_quickapp_bytes() {
+    for mixed in [false, true] {
+        for normalized in [false, true] {
+            let image = template(2, 0x10);
+            let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), image.clone())]);
+            let mut replacements = BTreeMap::from([
+                ("native/canopus.bin".into(), image.clone()),
+                ("native/quickapp.bin".into(), image.clone()),
+            ]);
+            let mut mappings = vec![
+                json!({"source":"/data/canopus/manager_icon.bin", "destination":"native/canopus.bin"}),
+            ];
+            if mixed {
+                replacements.insert("app/icons/stock.bin".into(), image.clone());
+                mappings.push(json!({"source":"/resource/app/", "destination":"app/"}));
+            }
+            if normalized {
+                mappings.push(json!({"source":"@quickapp-icon/org.example.app", "destination":"native/quickapp.bin"}));
+            }
+            let mut original_manifest = manifest(json!(mappings));
+            if !normalized {
+                original_manifest["quickappIcons"] =
+                    json!([{"package":"org.example.app", "destination":"native/quickapp.bin"}]);
+            }
+            let root = fixture(&firmware_files, &replacements, &original_manifest);
+            let imported = import(root.path(), "theme");
+            assert_eq!(
+                imported["resources"].as_array().unwrap().len(),
+                if mixed { 3 } else { 2 }
+            );
+            assert_eq!(imported["unmapped"], json!([]));
+            let theme = read_json(&root.path().join("theme/theme.json"));
+            assert_eq!(theme["canopusIcon"]["mode"], "raw");
+            assert_eq!(theme["quickappIcons"]["org.example.app"]["mode"], "raw");
+            let built = result(
+                run(
+                    root.path(),
+                    &["build", "--theme", "theme", "--target", "default", "--json"],
+                ),
+                true,
+            );
+            let pack = crpack::parse_crpack(
+                &fs::read(root.path().join(built["outputs"][0].as_str().unwrap())).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(pack.replacements["canopus/manager_icon.bin"], image);
+            assert_eq!(
+                pack.replacements[&conora_core::app_icons::destination("org.example.app")],
+                image
+            );
+            assert_eq!(pack.quickapp_icons.len(), 1);
+            assert_eq!(pack.quickapp_icons[0].package, "org.example.app");
+            result(
+                run(
+                    root.path(),
+                    &[
+                        "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+                    ],
+                ),
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn quickapp_declaration_overlapping_a_firmware_mapping_is_not_silently_dropped() {
+    let files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+    let mut original_manifest = standard_manifest();
+    original_manifest["quickappIcons"] =
+        json!([{"package":"org.example.app", "destination":"app/icons/stock.bin"}]);
+    let root = fixture(&files, &files, &original_manifest);
+    let failure = rejected(root.path());
+    assert_eq!(failure["errors"][0]["code"], "ambiguous_mapping");
+}
+
+#[test]
+fn native_consumers_can_share_one_original_bin_without_dropping_declarations() {
+    for canopus in [false, true] {
+        for normalized in [false, true] {
+            let image = template(2, 0x10);
+            let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), image.clone())]);
+            let replacements = BTreeMap::from([("native/shared.bin".into(), image.clone())]);
+            let mut mappings = Vec::new();
+            if canopus {
+                mappings.push(json!({"source":"/data/canopus/manager_icon.bin", "destination":"native/shared.bin"}));
+            }
+            if normalized {
+                mappings.push(json!({"source":"@quickapp-icon/org.example.first", "destination":"native/shared.bin"}));
+            }
+            let mut original_manifest = manifest(json!(mappings));
+            let mut declarations =
+                vec![json!({"package":"org.example.second", "destination":"native/shared.bin"})];
+            if !normalized {
+                declarations.push(
+                    json!({"package":"org.example.first", "destination":"native/shared.bin"}),
+                );
+            }
+            original_manifest["quickappIcons"] = json!(declarations);
+            let root = fixture(&firmware_files, &replacements, &original_manifest);
+            let imported = import(root.path(), "theme");
+            assert_eq!(
+                imported["resources"].as_array().unwrap().len(),
+                if canopus { 3 } else { 2 }
+            );
+            assert_eq!(imported["unmapped"], json!([]));
+            let theme = read_json(&root.path().join("theme/theme.json"));
+            let first = &theme["quickappIcons"]["org.example.first"];
+            assert_eq!(first["mode"], "raw");
+            assert_eq!(theme["quickappIcons"]["org.example.second"], *first);
+            if canopus {
+                assert_eq!(theme["canopusIcon"], *first);
+            }
+            assert_eq!(
+                fs::read(
+                    root.path()
+                        .join("theme")
+                        .join(first["input"].as_str().unwrap())
+                )
+                .unwrap(),
+                image
+            );
+            let built = result(
+                run(
+                    root.path(),
+                    &["build", "--theme", "theme", "--target", "default", "--json"],
+                ),
+                true,
+            );
+            let pack = crpack::parse_crpack(
+                &fs::read(root.path().join(built["outputs"][0].as_str().unwrap())).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(pack.quickapp_icons.len(), 2);
+            for icon in &pack.quickapp_icons {
+                assert_eq!(pack.replacements[&icon.destination], image);
+            }
+            if canopus {
+                assert_eq!(pack.replacements["canopus/manager_icon.bin"], image);
+            }
+            result(
+                run(
+                    root.path(),
+                    &[
+                        "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+                    ],
+                ),
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_opaque_quickapp_keys_with_trailing_slash_import_build_and_preview() {
+    let image = template(2, 0x10);
+    let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), image.clone())]);
+    let replacements = BTreeMap::from([("native/shared.bin".into(), image.clone())]);
+    let packages = ["", "single", " 快应用 ", "a..b", r"C:\foo:bar", "a\u{0085}"];
+    let trailing = "../../快应用/";
+    let mut original_manifest = manifest(json!([{
+        "source": conora_core::app_icons::source(trailing), "destination":"native/shared.bin"
+    }]));
+    original_manifest["quickappIcons"] = json!(packages.map(|package| json!({
+        "package":package, "destination":"native/shared.bin"
+    })));
+    let root = fixture(&firmware_files, &replacements, &original_manifest);
+    let imported = import(root.path(), "theme");
+    assert_eq!(
+        imported["resources"].as_array().unwrap().len(),
+        packages.len() + 1
+    );
+    assert_eq!(imported["unmapped"], json!([]));
+    let theme = read_json(&root.path().join("theme/theme.json"));
+    let shared = &theme["quickappIcons"][trailing];
+    for package in packages {
+        assert_eq!(theme["quickappIcons"][package], *shared);
+    }
+    let input = shared["input"].as_str().unwrap();
+    assert_eq!(input, "source/raw/native/shared.bin");
+    assert_eq!(
+        fs::read(root.path().join("theme").join(input)).unwrap(),
+        image
+    );
+    let built = result(
+        run(
+            root.path(),
+            &["build", "--theme", "theme", "--target", "default", "--json"],
+        ),
+        true,
+    );
+    let pack = crpack::parse_crpack(
+        &fs::read(root.path().join(built["outputs"][0].as_str().unwrap())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pack.quickapp_icons.len(), packages.len() + 1);
+    assert!(pack.mappings.is_empty());
+    for package in packages.into_iter().chain([trailing]) {
+        let destination = conora_core::app_icons::destination(package);
+        assert!(
+            pack.quickapp_icons
+                .iter()
+                .any(|icon| icon.package == package && icon.destination == destination)
+        );
+        assert_eq!(pack.replacements[&destination], image);
+    }
+    result(
+        run(
+            root.path(),
+            &[
+                "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+            ],
+        ),
+        true,
+    );
+    let index = read_json(
+        &root
+            .path()
+            .join("theme/previews/preview_index-default.json"),
+    );
+    for entry in index["resources"].as_array().unwrap() {
+        let filename = entry["png"].as_str().unwrap();
+        assert_eq!(Path::new(filename).components().count(), 1);
+        assert!(root.path().join("theme/previews").join(filename).is_file());
+    }
+}

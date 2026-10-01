@@ -165,12 +165,17 @@ fn target_previews(
     let mut skipped = 0usize;
     // Reports have deterministic role/resource ordering and identify overrides as well.
     for resource in &report.resources {
-        let built = pack.replacements.get(&resource.resource).ok_or_else(|| {
-            Failure::new(
-                "preview_pack",
-                format!("built pack omits {}", resource.resource),
-            )
-        })?;
+        let built = pack
+            .replacements
+            .get(&super::icon::archive_path(&resource.resource))
+            .ok_or_else(|| {
+                Failure::new(
+                    "preview_pack",
+                    format!("built pack omits {}", resource.resource),
+                )
+            })?;
+        // Resource identities may contain opaque QuickApp packages (including
+        // path separators); only the hashed ID belongs in preview filenames.
         let resource_id = resource_id(&resource.role, &resource.resource);
         let mut entry = json!({"id": resource_id, "role": resource.role, "resource": resource.resource,
             "mode": resource.mode, "lossy": resource.lossy});
@@ -381,12 +386,30 @@ fn verify_replacements(
         .collect();
     let mut values = BTreeMap::new();
     let mut paths = Vec::new();
-    for path in replacements.keys() {
+    for summary in &report.resources {
+        let path = &summary.resource;
         let summary = summaries
             .get(path.as_str())
             .ok_or_else(|| Failure::new("preview_verify", "replacement has no resource summary"))?;
         if summary.mode == project::AssetMode::Raw {
             values.insert(path.clone(), json!({"status": "notApplicable", "reason": "raw replacements have no PNG conversion contract"}));
+        } else if let Some(asset) = super::icon::asset(theme, &target, path)? {
+            let original = if let Some(template) = asset["template"].as_str() {
+                project::read_limited(&theme.root.join(template), project::MAX_TEMPLATE_BYTES)?
+            } else if path == conora_core::app_icons::CANOPUS_SOURCE {
+                conora_core::app_icons::canopus_template()
+            } else {
+                return Err(Failure::new(
+                    "preview_verify",
+                    "native PNG icon has no template",
+                ));
+            };
+            let built = replacements
+                .get(&super::icon::archive_path(path))
+                .ok_or_else(|| Failure::new("preview_verify", "native replacement missing"))?;
+            let verified = verify_image(summary, &original, built)
+                .map_err(|e| Failure::new("preview_verify", format!("{path}: {e}")))?;
+            values.insert(path.clone(), verified);
         } else {
             paths.push(path.clone());
         }
@@ -402,45 +425,45 @@ fn verify_replacements(
                     .get(path)
                     .ok_or("replacement has no resource summary")?;
                 let built = replacements.get(path).ok_or("replacement missing")?;
-                let original_info =
-                    lvgl::inspect_image(original).ok_or("original template is not an image")?;
-                let (info, actual) = decode_bounded(built)?;
-                let same_metadata = info == original_info;
-                // LVGL fixed headers must be preserved, including stride, flags and reserved bytes.
-                // PNG/JPEG encoded headers may change legitimately; compare image metadata instead.
-                let header_len = match info.format {
-                    lvgl::ImageFormatKind::Png | lvgl::ImageFormatKind::Jpeg => 0,
-                    lvgl::ImageFormatKind::Lvgl8I8 | lvgl::ImageFormatKind::Lvgl8Rgb565 => 4,
-                    _ => 12,
-                };
-                let same_header = built.get(..header_len) == original.get(..header_len);
-                if !same_metadata || !same_header {
-                    return Err(format!(
-                        "{path}: built image metadata/template header differs from pinned original"
-                    ));
-                }
-                let source = project::read_limited(&summary.input, project::MAX_TEMPLATE_BYTES)?;
-                let source = raster_bounded(&source)?;
-                let expected = imageops::resize(
-                    &source,
-                    actual.width(),
-                    actual.height(),
-                    imageops::FilterType::Nearest,
-                );
-                let same_pixels = actual == expected;
-                if !same_pixels && !summary.lossy {
-                    return Err(format!(
-                        "{path}: built pixels differ from nearest-resized source"
-                    ));
-                }
-                values.insert(
-                    path.to_owned(),
-                    json!({"status": "verified", "sameMetadata": same_metadata,
-            "sameHeader": same_header, "samePixels": same_pixels, "lossy": summary.lossy}),
-                );
+                let verified =
+                    verify_image(summary, original, built).map_err(|e| format!("{path}: {e}"))?;
+                values.insert(path.to_owned(), verified);
                 Ok(())
             },
         )
         .map_err(|e| Failure::new("preview_verify", e))?;
     Ok(values)
+}
+
+fn verify_image(
+    summary: &project::ResourceSummary,
+    original: &[u8],
+    built: &[u8],
+) -> std::result::Result<Value, String> {
+    let original_info = lvgl::inspect_image(original).ok_or("original template is not an image")?;
+    let (info, actual) = decode_bounded(built)?;
+    let same_metadata = info == original_info;
+    let header_len = match info.format {
+        lvgl::ImageFormatKind::Png | lvgl::ImageFormatKind::Jpeg => 0,
+        lvgl::ImageFormatKind::Lvgl8I8 | lvgl::ImageFormatKind::Lvgl8Rgb565 => 4,
+        _ => 12,
+    };
+    let same_header = built.get(..header_len) == original.get(..header_len);
+    if !same_metadata || !same_header {
+        return Err("built image metadata/template header differs from original".into());
+    }
+    let source = project::read_limited(&summary.input, project::MAX_TEMPLATE_BYTES)?;
+    let source = raster_bounded(&source)?;
+    let expected = imageops::resize(
+        &source,
+        actual.width(),
+        actual.height(),
+        imageops::FilterType::Nearest,
+    );
+    let same_pixels = actual == expected;
+    if !same_pixels && !summary.lossy {
+        return Err("built pixels differ from nearest-resized source".into());
+    }
+    Ok(json!({"status":"verified", "sameMetadata":same_metadata,
+        "sameHeader":same_header, "samePixels":same_pixels, "lossy":summary.lossy}))
 }

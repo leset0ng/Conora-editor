@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+use crate::app_icons;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -23,6 +26,8 @@ pub struct UnpackedCrpack {
     pub replacements: BTreeMap<String, Vec<u8>>,
     /// Original ordered rules; replacement filenames do not imply firmware source paths.
     pub mappings: Vec<Mapping>,
+    /// Optional application declarations, separate from firmware mappings.
+    pub quickapp_icons: Vec<QuickappIcon>,
     pub targets: Vec<String>,
     /// Original manifest, including unknown fields, for verbatim CLI extraction/transfer.
     pub manifest_bytes: Vec<u8>,
@@ -57,6 +62,12 @@ pub struct Mapping {
     pub destination: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct QuickappIcon {
+    pub package: String,
+    pub destination: String,
+}
+
 /// Validate authoring metadata independently of whether a project has assets yet.
 pub fn validate_pack_metadata(
     theme_id: &str,
@@ -80,6 +91,34 @@ pub fn validate_pack_metadata(
 }
 
 pub fn build_crpack(options: &PackOptions<'_>) -> Result<Vec<u8>, String> {
+    build_crpack_with_icons(options, &[], &[])
+}
+
+/// Build firmware replacements and explicit application declarations together.
+/// Explicitly referenced assets never acquire an inferred /resource/ mapping.
+pub fn build_crpack_with_icons(
+    options: &PackOptions<'_>,
+    explicit_mappings: &[Mapping],
+    quickapp_icons: &[QuickappIcon],
+) -> Result<Vec<u8>, String> {
+    let mut mappings = firmware_mappings(options.replacements.keys().filter(|path| {
+        !quickapp_icons.iter().any(|icon| icon.destination == **path)
+            && !explicit_mappings.iter().any(|mapping| {
+                mapping.destination == **path
+                    || (mapping.destination.ends_with('/')
+                        && path.starts_with(&mapping.destination))
+            })
+    }))?;
+    mappings.extend_from_slice(explicit_mappings);
+    build_crpack_with_mappings(options, &mappings, quickapp_icons)
+}
+
+/// Serialize authoritative rules exactly, leaving unreferenced imported files unmapped.
+pub fn build_crpack_with_mappings(
+    options: &PackOptions<'_>,
+    mappings: &[Mapping],
+    quickapp_icons: &[QuickappIcon],
+) -> Result<Vec<u8>, String> {
     validate_pack_metadata(
         options.theme_id,
         options.name,
@@ -90,7 +129,7 @@ pub fn build_crpack(options: &PackOptions<'_>) -> Result<Vec<u8>, String> {
     )?;
 
     if options.replacements.is_empty() {
-        return Err("replace at least one firmware resource before exporting".into());
+        return Err("replace at least one resource or application icon before exporting".into());
     }
 
     let mut total_bytes = 0usize;
@@ -108,12 +147,15 @@ pub fn build_crpack(options: &PackOptions<'_>) -> Result<Vec<u8>, String> {
         options.replacements.keys().map(String::as_str),
         options.replacements,
     )?;
-    let mappings = mappings_for_paths(options.replacements.keys())?;
-    validate_mappings(&mappings, options.theme_id)?;
-    validate_mapping_destinations(&mappings, options.theme_id, options.replacements)?;
+    validate_icon_declarations(
+        mappings,
+        quickapp_icons,
+        options.theme_id,
+        options.replacements,
+    )?;
 
     let mut mapping_json = Vec::with_capacity(mappings.len());
-    for mapping in &mappings {
+    for mapping in mappings {
         mapping_json.push(json!({
             "source": mapping.source,
             "destination": mapping.destination,
@@ -132,6 +174,13 @@ pub fn build_crpack(options: &PackOptions<'_>) -> Result<Vec<u8>, String> {
     );
     manifest.insert("name".into(), Value::String(options.name.to_string()));
     manifest.insert("mappings".into(), Value::Array(mapping_json));
+    if !quickapp_icons.is_empty() {
+        manifest.insert(
+            "quickappIcons".into(),
+            serde_json::to_value(quickapp_icons)
+                .map_err(|error| format!("could not serialize quickappIcons: {error}"))?,
+        );
+    }
     if let Some(version) = options.version {
         manifest.insert("version".into(), Value::String(version.to_string()));
     }
@@ -338,8 +387,12 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
             destination: required_string(mapping, "destination")?.to_string(),
         });
     }
-    validate_mappings(&mappings, &theme_id)?;
-    validate_mapping_destinations(&mappings, &theme_id, &replacements)?;
+    let quickapp_icons: Vec<QuickappIcon> = match obj.get("quickappIcons") {
+        None => Vec::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid quickappIcons: {error}"))?,
+    };
+    validate_icon_declarations(&mappings, &quickapp_icons, &theme_id, &replacements)?;
     Ok(UnpackedCrpack {
         theme_id,
         name,
@@ -350,6 +403,7 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
         targets,
         replacements,
         mappings,
+        quickapp_icons,
         manifest_bytes,
     })
 }
@@ -449,7 +503,10 @@ fn validate_central_directory(
     Ok(())
 }
 
-fn mappings_for_paths<'a>(paths: impl Iterator<Item = &'a String>) -> Result<Vec<Mapping>, String> {
+/// Infer directory-grouped mappings only for intentionally authored firmware files.
+pub fn firmware_mappings<'a>(
+    paths: impl Iterator<Item = &'a String>,
+) -> Result<Vec<Mapping>, String> {
     let mut groups = BTreeMap::<String, bool>::new();
     for path in paths {
         let group = match path.split_once('/') {
@@ -491,7 +548,15 @@ fn validate_mappings(mappings: &[Mapping], theme_id: &str) -> Result<(), String>
     for mapping in mappings {
         validate_absolute_source(&mapping.source)?;
         validate_relative_destination(&mapping.destination)?;
-        if mapping.source.ends_with('/') != mapping.destination.ends_with('/') {
+        let quickapp = mapping
+            .source
+            .starts_with(app_icons::QUICKAPP_SOURCE_PREFIX);
+        if quickapp && !mapping.destination.ends_with(".bin") {
+            return Err("QuickApp icon destination must be a lowercase .bin file".into());
+        }
+        // A QuickApp source is a semantic key, even when its package ends in '/'.
+        // Its .bin destination is always a file, never a directory mapping.
+        if !quickapp && mapping.source.ends_with('/') != mapping.destination.ends_with('/') {
             return Err(
                 "mapping source and destination must both be files or both be directories".into(),
             );
@@ -515,6 +580,32 @@ fn validate_mappings(mappings: &[Mapping], theme_id: &str) -> Result<(), String>
         return Err("generated mappings.tsv exceeds the 32 KiB device limit".into());
     }
     Ok(())
+}
+
+fn validate_icon_declarations(
+    mappings: &[Mapping],
+    icons: &[QuickappIcon],
+    theme_id: &str,
+    replacements: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    if mappings.len().saturating_add(icons.len()) > MAX_MAPPINGS {
+        return Err(format!(
+            "mappings and quickappIcons allow at most {MAX_MAPPINGS} combined rules"
+        ));
+    }
+    let mut combined = mappings.to_vec();
+    for icon in icons {
+        app_icons::validate_package(&icon.package)?;
+        if !icon.destination.ends_with(".bin") {
+            return Err("QuickApp icon destination must be a lowercase .bin file".into());
+        }
+        combined.push(Mapping {
+            source: app_icons::source(&icon.package),
+            destination: icon.destination.clone(),
+        });
+    }
+    validate_mappings(&combined, theme_id)?;
+    validate_mapping_destinations(&combined, theme_id, replacements)
 }
 
 fn validate_mapping_destinations(
@@ -650,7 +741,14 @@ fn validate_archive_path(path: &str) -> Result<(), String> {
 }
 
 fn validate_absolute_source(path: &str) -> Result<(), String> {
-    if !path.starts_with('/') || path.len() >= MAX_PATH_BYTES {
+    // This is the serialized source budget, including a semantic key's prefix.
+    if path.len() >= MAX_PATH_BYTES {
+        return Err(format!("mapping source exceeds 255 UTF-8 bytes: {path:?}"));
+    }
+    if let Some(package) = path.strip_prefix(app_icons::QUICKAPP_SOURCE_PREFIX) {
+        return app_icons::validate_package(package);
+    }
+    if !path.starts_with('/') {
         return Err(format!(
             "mapping source must be a short absolute firmware path: {path:?}"
         ));

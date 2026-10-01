@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use conora_core::{crpack, lvgl, project};
+use conora_core::{app_icons, crpack, lvgl, project};
 use serde_json::{Value, json};
 
 use super::{Failure, Result, absolute, io_failure, json_bytes, path_text, portable_relative};
@@ -202,11 +202,50 @@ pub(super) fn run(args: Import) -> Result<Value> {
     let mut resolved = BTreeMap::new();
     let mut claimed = BTreeSet::new();
     let mut unmapped = Vec::new();
+    let mut native = BTreeMap::<String, Vec<String>>::new();
+    let mut native_claimed = BTreeSet::new();
+    for icon in &pack.quickapp_icons {
+        let identity = format!("{}{}", app_icons::QUICKAPP_SOURCE_PREFIX, icon.package);
+        if !native_claimed.insert(identity.clone()) {
+            return Err(Failure::new(
+                "ambiguous_mapping",
+                "duplicate QuickApp icon declaration",
+            ));
+        }
+        native
+            .entry(icon.destination.clone())
+            .or_default()
+            .push(identity);
+    }
 
     // The ordered rules are retained, but the project builder only supports
     // resource replacements, not arbitrary filesystem remaps. Never silently
     // turn a /system rule into a guessed /resource binding.
     for rule in &pack.mappings {
+        if rule.source == app_icons::CANOPUS_SOURCE
+            || rule.source.starts_with(app_icons::QUICKAPP_SOURCE_PREFIX)
+        {
+            if let Some(package) = rule.source.strip_prefix(app_icons::QUICKAPP_SOURCE_PREFIX) {
+                app_icons::validate_package(package)?;
+            }
+            if rule.destination.ends_with('/') || !rule.destination.ends_with(".bin") {
+                return Err(Failure::new(
+                    "nonportable_mapping",
+                    "native icon mapping must name a .bin file",
+                ));
+            }
+            if !native_claimed.insert(rule.source.clone()) {
+                return Err(Failure::new(
+                    "ambiguous_mapping",
+                    "duplicate native icon mapping",
+                ));
+            }
+            native
+                .entry(rule.destination.clone())
+                .or_default()
+                .push(rule.source.clone());
+            continue;
+        }
         if !rule.source.starts_with("/resource/") {
             return Err(Failure::new(
                 "nonportable_mapping",
@@ -225,6 +264,20 @@ pub(super) fn run(args: Import) -> Result<Value> {
         }
     }
     for path in pack.replacements.keys() {
+        if native.contains_key(path) {
+            // Sharing one archive BIN among native consumers is unambiguous.
+            // A simultaneous ordinary firmware rule has separate resource-path
+            // semantics, which this importer must not silently discard.
+            if pack.mappings.iter().any(|rule| {
+                rule.source.starts_with("/resource/") && suffix(path, &rule.destination).is_some()
+            }) {
+                return Err(Failure::new(
+                    "ambiguous_mapping",
+                    "native icon overlaps an ordinary firmware mapping destination",
+                ));
+            }
+            continue;
+        }
         let matches: Vec<_> = pack
             .mappings
             .iter()
@@ -283,7 +336,7 @@ pub(super) fn run(args: Import) -> Result<Value> {
         }
         resolved.insert(path.clone(), resource.to_owned());
     }
-    if resolved.is_empty() {
+    if resolved.is_empty() && native.is_empty() {
         return Err(Failure::new(
             "missing_binding",
             "pack has no resource mappings that can become project bindings",
@@ -310,6 +363,8 @@ pub(super) fn run(args: Import) -> Result<Value> {
     write_file(stage_root, "source/original.crpack", &pack_bytes)?;
     write_file(stage_root, "source/canora.json", &pack.manifest_bytes)?;
     let mut icons = BTreeMap::new();
+    let mut quickapp_icons = BTreeMap::new();
+    let mut canopus_icon = None;
     let mut bindings = BTreeMap::new();
     let mut overrides = BTreeMap::new();
     let mut used = BTreeSet::new();
@@ -317,6 +372,29 @@ pub(super) fn run(args: Import) -> Result<Value> {
     for (path, bytes) in &pack.replacements {
         let raw_path = format!("source/raw/{path}");
         write_file(stage_root, &raw_path, bytes)?;
+        if let Some(identities) = native.get(path) {
+            // Native slots have no ROMFS binding. Multiple consumers safely
+            // share the original validated BIN in the project-owned raw tree.
+            app_icons::inspect_bin(bytes)?;
+            for identity in identities {
+                let asset = json!({"input":raw_path, "mode":"raw"});
+                if identity == app_icons::CANOPUS_SOURCE {
+                    canopus_icon = Some(asset);
+                } else {
+                    quickapp_icons.insert(
+                        identity
+                            .strip_prefix(app_icons::QUICKAPP_SOURCE_PREFIX)
+                            .unwrap()
+                            .to_owned(),
+                        asset,
+                    );
+                }
+                resources.push(
+                    json!({"archivePath":path, "resource":identity, "mode":"raw", "native":true}),
+                );
+            }
+            continue;
+        }
         let Some(resource) = resolved.get(path) else {
             continue;
         };
@@ -361,6 +439,12 @@ pub(super) fn run(args: Import) -> Result<Value> {
     let mut theme = json!({
         "schemaVersion": 1, "themeId": pack.theme_id, "name": pack.name, "icons": icons
     });
+    if let Some(asset) = canopus_icon {
+        theme["canopusIcon"] = asset;
+    }
+    if !quickapp_icons.is_empty() {
+        theme["quickappIcons"] = json!(quickapp_icons);
+    }
     for (key, value) in [
         ("version", &pack.version),
         ("author", &pack.author),
@@ -388,7 +472,12 @@ pub(super) fn run(args: Import) -> Result<Value> {
         fs::create_dir_all(&path)
             .map_err(|error| io_failure("could not create import directory", &path, error))?;
     }
-    let report = json!({"mappings": mappings, "unmapped": unmapped, "resources": resources, "diagnostics": diagnostics});
+    let quickapp_declarations: Vec<_> = pack
+        .quickapp_icons
+        .iter()
+        .map(|icon| json!({"package":icon.package,"destination":icon.destination}))
+        .collect();
+    let report = json!({"quickappIcons":quickapp_declarations,"mappings": mappings, "unmapped": unmapped, "resources": resources, "diagnostics": diagnostics});
     write_file(stage_root, "source/import.json", &json_bytes(&report)?)?;
 
     // Validate the staged configuration and all assets before publishing. The
@@ -414,7 +503,8 @@ pub(super) fn run(args: Import) -> Result<Value> {
     publish_noclobber(stage_root, &root)?;
     Ok(json!({
         "theme": root.join("theme.json"), "target": args.target, "firmwareSha256": firmware.sha256,
-        "mappings": mappings, "unmapped": unmapped, "resources": resources, "diagnostics": diagnostics
+        "mappings": mappings, "quickappIcons":quickapp_declarations,
+        "unmapped": unmapped, "resources": resources, "diagnostics": diagnostics
     }))
 }
 

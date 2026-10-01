@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
 mod adapt;
+mod icon;
 mod import_pack;
 mod preview;
 
@@ -35,6 +36,11 @@ enum Command {
     Target {
         #[command(subcommand)]
         command: TargetCommand,
+    },
+    /// Manage Canopus and QuickApp filesystem icons.
+    Icon {
+        #[command(subcommand)]
+        command: icon::IconCommand,
     },
     /// List resources in a firmware.
     Ls(List),
@@ -223,6 +229,7 @@ fn main() -> ExitCode {
     let command_name = match &cli.command {
         Command::Init(_) => "init",
         Command::Target { .. } => "target add",
+        Command::Icon { command } => command.name(),
         Command::Ls(_) => "ls",
         Command::Extract(_) => "extract",
         Command::Check(_) => "check",
@@ -358,6 +365,7 @@ fn run(command: Command) -> Result<Value> {
         Command::Target {
             command: TargetCommand::Add(args),
         } => target_add(args),
+        Command::Icon { command } => icon::run(command),
         Command::Ls(args) => list(args),
         Command::Extract(args) => extract(args),
         Command::Check(args) => check_build(args, None),
@@ -1037,6 +1045,7 @@ fn project_inputs(
     let theme =
         serde_json::to_value(&project.theme).map_err(|e| Failure::new("json", e.to_string()))?;
     collect_assets(&theme["icons"], &project.root, &mut inputs);
+    icon::collect_inputs(&theme, &project.root, &mut inputs);
     let directory = project.root.join("targets");
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -1060,6 +1069,7 @@ fn project_inputs(
             inputs.push(path.parent().unwrap().join(firmware));
         }
         collect_assets(&config["overrides"], &project.root, &mut inputs);
+        icon::collect_inputs(&config, &project.root, &mut inputs);
     }
     Ok(inputs)
 }
