@@ -1,6 +1,6 @@
 # Conora CRPack Builder
 
-AstroBox NG API Level 4 Rust/WASM plugin for creating Canopus Resource Pack (`.crpack`) v1 files from watch firmware.
+An AstroBox NG API Level 4 Rust/WASM editor and native `conora` CLI for creating Canopus Resource Pack (`.crpack`) v1 files from watch firmware. Both use the same `conora-core` library.
 
 ## What it does
 
@@ -17,7 +17,26 @@ CRPack export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.m
 
 The initial target is Xiaomi Band 11 firmware `4.100.155`; `targets` is inferred from the selected firmware filename when possible and remains editable. The importer streams the ROMFS tree into metadata and reads original file bytes lazily; it does not keep a full expanded ROMFS in memory. AstroBox's file-picker still passes the complete compressed archive to the WASM plugin. For deflated ROMFS entries, loading a selected file may need to inflate the stream up to that file's offset, trading latency for lower memory use. Actual imports remain subject to available host memory.
 
-## Build
+## Native CLI: one icon theme, multiple firmwares
+
+The CLI separates shared source assets in `theme.json` from per-firmware resource bindings in `targets/*.json`. Each target pins the SHA-256 of its complete firmware (no per-resource hashes) and uses that firmware's original image templates. Builds produce one `.crpack` per target; no model service or AstroBox host is required.
+
+```bash
+cargo install --path crates/conora-cli --locked
+conora init my-icons --theme-id dark --name "Dark Icons" \
+  --firmware /path/to/firmware-A.bin --target band11-A
+conora target add band11-B --theme my-icons --firmware /path/to/firmware-B.bin
+conora ls --theme my-icons --target band11-A --images --json
+# Add source images and declare logical icon roles and target bindings.
+conora check --theme my-icons --all-targets --json
+conora build --theme my-icons --all-targets --output ./packs
+```
+
+After the core and CLI crates are published to crates.io, installation will also be available with `cargo install conora-cli --locked`. They are not published by this repository change.
+
+See [the CLI guide](crates/conora-cli/README.md) for schemas, extraction, overrides, machine-readable diagnostics and safety rules.
+
+## AstroBox plugin build
 
 Requires an AstroBox NG host with API Level 4 support.
 
@@ -28,12 +47,15 @@ rustup target add wasm32-wasip2
 python3 scripts/build_dist.py --release --package
 ```
 
-The `.abp` output is the installable AstroBox plugin. The `.crpack` is generated later from the plugin UI.
+The `.abp` output is the installable AstroBox plugin. A `.crpack` is generated from either the plugin UI or the native CLI.
+
+The root package remains the plugin; `crates/conora-core` and `crates/conora-cli` are workspace members. Default Cargo commands build/test the native core and CLI. The plugin script selects its package and `wasm32-wasip2` target explicitly.
 
 ## Tests
 
 ```bash
-cargo test --target aarch64-apple-darwin
+cargo test --locked
+cargo test -p conora-crpack-builder
 CONORA_TEST_FIRMWARE="$HOME/develop/temp/miwear.watch.q66tc_v4.100.155_full_f1c824fe.bin" \
-  cargo test --target aarch64-apple-darwin parses_real_firmware_when_requested -- --nocapture
+  cargo test -p conora-core parses_real_firmware_when_requested -- --nocapture
 ```

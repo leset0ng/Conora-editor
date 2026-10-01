@@ -1,2 +1,1 @@
-[build]
-target = "wasm32-wasip2"
+# Native targets are the default. The plugin build script selects WASM explicitly.

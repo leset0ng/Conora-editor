@@ -1,10 +1,8 @@
 use astrobox_ng_wit::astrobox::psys_host_v4::ui as host_ui;
 use astrobox_ng_wit::exports::astrobox::psys_plugin_v4::{event, lifecycle};
 
-pub mod crpack;
-pub mod firmware;
+pub use conora_core::{crpack, firmware, lvgl};
 pub mod logger;
-pub mod lvgl;
 pub mod ui;
 
 struct MyPlugin;

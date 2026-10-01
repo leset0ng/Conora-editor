@@ -296,7 +296,10 @@ impl FirmwareIndex {
         } else {
             format!("{}/", dir.trim_end_matches('/'))
         };
-        self.files.iter().filter(|f| f.path.starts_with(&prefix)).count()
+        self.files
+            .iter()
+            .filter(|f| f.path.starts_with(&prefix))
+            .count()
     }
 
     pub fn dir_has_images(&self, dir: &str) -> bool {
@@ -835,8 +838,8 @@ mod tests {
                 .file_bytes(path)
                 .expect("read sample file")
                 .unwrap_or_else(|| panic!("fixture contains {}", path));
-            let (info, png) =
-                lvgl::decode_image_png(file_bytes.as_slice()).unwrap_or_else(|e| panic!("decode {} failed: {}", label, e));
+            let (info, png) = lvgl::decode_image_png(file_bytes.as_slice())
+                .unwrap_or_else(|e| panic!("decode {} failed: {}", label, e));
             assert!(info.width > 0 && info.height > 0);
             assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
 

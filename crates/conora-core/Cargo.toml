@@ -1,0 +1,22 @@
+[package]
+name = "conora-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Firmware resource inspection, image conversion and CRPack building for Conora"
+license = "MIT"
+repository = "https://github.com/leset0ng/Conora-editor"
+readme = "README.md"
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -183,7 +183,7 @@ pub fn inspect_image_header(header: &[u8], image_size: usize) -> Option<ImageInf
         let reserved = u16::from_le_bytes([header[10], header[11]]);
 
         let min_stride = match cf {
-            0x09 | 0x0D => (width + 1) / 2,
+            0x09 | 0x0D => width.div_ceil(2),
             0x10 => width.saturating_mul(4),
             0x0A | 0x0E => width,
             _ => return None,
@@ -199,22 +199,53 @@ pub fn inspect_image_header(header: &[u8], image_size: usize) -> Option<ImageInf
         }
 
         let (format, min_raw_len) = match (cf, flags) {
-            (0x0A, 0) => (ImageFormatKind::Lvgl9I8, PALETTE_BYTES_I8 + usize::from(stride) * usize::from(height)),
-            (0x0A, 8) => (ImageFormatKind::Lvgl9I8Rle, PALETTE_BYTES_I8 + usize::from(stride) * usize::from(height)),
-            (0x0E, 0) => (ImageFormatKind::Lvgl9A8, usize::from(stride) * usize::from(height)),
-            (0x0E, 8) => (ImageFormatKind::Lvgl9A8Rle, usize::from(stride) * usize::from(height)),
-            (0x10, 0) => (ImageFormatKind::Lvgl9Argb8888, usize::from(stride) * usize::from(height)),
-            (0x10, 8) => (ImageFormatKind::Lvgl9Argb8888Rle, usize::from(stride) * usize::from(height)),
-            (0x09, 0) => (ImageFormatKind::Lvgl9I4, PALETTE_BYTES_I4 + usize::from(stride) * usize::from(height)),
-            (0x09, 8) => (ImageFormatKind::Lvgl9I4Rle, PALETTE_BYTES_I4 + usize::from(stride) * usize::from(height)),
-            (0x0D, 0) => (ImageFormatKind::Lvgl9A4, usize::from(stride) * usize::from(height)),
-            (0x0D, 8) => (ImageFormatKind::Lvgl9A4Rle, usize::from(stride) * usize::from(height)),
+            (0x0A, 0) => (
+                ImageFormatKind::Lvgl9I8,
+                PALETTE_BYTES_I8 + usize::from(stride) * usize::from(height),
+            ),
+            (0x0A, 8) => (
+                ImageFormatKind::Lvgl9I8Rle,
+                PALETTE_BYTES_I8 + usize::from(stride) * usize::from(height),
+            ),
+            (0x0E, 0) => (
+                ImageFormatKind::Lvgl9A8,
+                usize::from(stride) * usize::from(height),
+            ),
+            (0x0E, 8) => (
+                ImageFormatKind::Lvgl9A8Rle,
+                usize::from(stride) * usize::from(height),
+            ),
+            (0x10, 0) => (
+                ImageFormatKind::Lvgl9Argb8888,
+                usize::from(stride) * usize::from(height),
+            ),
+            (0x10, 8) => (
+                ImageFormatKind::Lvgl9Argb8888Rle,
+                usize::from(stride) * usize::from(height),
+            ),
+            (0x09, 0) => (
+                ImageFormatKind::Lvgl9I4,
+                PALETTE_BYTES_I4 + usize::from(stride) * usize::from(height),
+            ),
+            (0x09, 8) => (
+                ImageFormatKind::Lvgl9I4Rle,
+                PALETTE_BYTES_I4 + usize::from(stride) * usize::from(height),
+            ),
+            (0x0D, 0) => (
+                ImageFormatKind::Lvgl9A4,
+                usize::from(stride) * usize::from(height),
+            ),
+            (0x0D, 8) => (
+                ImageFormatKind::Lvgl9A4Rle,
+                usize::from(stride) * usize::from(height),
+            ),
             _ => return None,
         };
 
         if flags == 8 {
             if header.len() >= HEADER_BYTES_V9 + COMP_HEADER_BYTES_V9 {
-                let comp_len = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+                let comp_len =
+                    u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
                 if 24 + comp_len > image_size {
                     return None;
                 }
@@ -270,11 +301,12 @@ pub fn inspect_image_header(header: &[u8], image_size: usize) -> Option<ImageInf
 
 pub fn inspect_image(data: &[u8]) -> Option<ImageInfo> {
     if let Some(mut info) = inspect_image_header(data, data.len()) {
-        if info.format == ImageFormatKind::Jpeg && (info.width == 0 || info.height == 0) {
-            if let Some((w, h)) = parse_jpeg_dimensions(data) {
-                info.width = w;
-                info.height = h;
-            }
+        if info.format == ImageFormatKind::Jpeg
+            && (info.width == 0 || info.height == 0)
+            && let Some((w, h)) = parse_jpeg_dimensions(data)
+        {
+            info.width = w;
+            info.height = h;
         }
         Some(info)
     } else {
@@ -382,7 +414,8 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                 if data.len() < 24 {
                     return Err("truncated LVGL9 RLE header".into());
                 }
-                let comp_len = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
+                let comp_len =
+                    u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
                 let raw_len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) as usize;
                 if data.len() < 24 + comp_len {
                     return Err("truncated LVGL9 RLE payload".into());
@@ -403,7 +436,12 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                         return Err("truncated LVGL9 I8 palette".into());
                     }
                     let mut palette = [[0u8; 4]; 256];
-                    for (idx, entry) in raw_payload[..PALETTE_BYTES_I8].as_chunks::<4>().0.iter().enumerate() {
+                    for (idx, entry) in raw_payload[..PALETTE_BYTES_I8]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .enumerate()
+                    {
                         palette[idx] = [entry[2], entry[1], entry[0], entry[3]];
                     }
                     let px_data = &raw_payload[PALETTE_BYTES_I8..];
@@ -423,7 +461,11 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                         let row_start = y * stride;
                         for x in 0..w {
                             let off = row_start + x;
-                            let alpha = if off < raw_payload.len() { raw_payload[off] } else { 0 };
+                            let alpha = if off < raw_payload.len() {
+                                raw_payload[off]
+                            } else {
+                                0
+                            };
                             img.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, alpha]));
                         }
                     }
@@ -450,7 +492,12 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                         return Err("truncated LVGL9 I4 palette".into());
                     }
                     let mut palette = [[0u8; 4]; 16];
-                    for (idx, entry) in raw_payload[..PALETTE_BYTES_I4].as_chunks::<4>().0.iter().enumerate() {
+                    for (idx, entry) in raw_payload[..PALETTE_BYTES_I4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .enumerate()
+                    {
                         palette[idx] = [entry[2], entry[1], entry[0], entry[3]];
                     }
                     let px_data = &raw_payload[PALETTE_BYTES_I4..];
@@ -460,7 +507,11 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                             let byte_off = row_start + x / 2;
                             if byte_off < px_data.len() {
                                 let byte_val = px_data[byte_off];
-                                let idx = if x % 2 == 0 { (byte_val >> 4) & 0x0F } else { byte_val & 0x0F };
+                                let idx = if x % 2 == 0 {
+                                    (byte_val >> 4) & 0x0F
+                                } else {
+                                    byte_val & 0x0F
+                                };
                                 let color = palette[idx as usize];
                                 img.put_pixel(x as u32, y as u32, image::Rgba(color));
                             }
@@ -475,9 +526,17 @@ pub fn decode_to_rgba(data: &[u8]) -> Result<(ImageInfo, RgbaImage), String> {
                             let byte_off = row_start + x / 2;
                             if byte_off < raw_payload.len() {
                                 let byte_val = raw_payload[byte_off];
-                                let val = if x % 2 == 0 { (byte_val >> 4) & 0x0F } else { byte_val & 0x0F };
+                                let val = if x % 2 == 0 {
+                                    (byte_val >> 4) & 0x0F
+                                } else {
+                                    byte_val & 0x0F
+                                };
                                 let alpha = val * 17;
-                                img.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, alpha]));
+                                img.put_pixel(
+                                    x as u32,
+                                    y as u32,
+                                    image::Rgba([255, 255, 255, alpha]),
+                                );
                             }
                         }
                     }
@@ -534,7 +593,10 @@ pub fn decode_i8_png(data: &[u8]) -> Result<(ImageInfo, Vec<u8>), String> {
     decode_image_png(data)
 }
 
-pub fn decode_i8_thumbnail_png(data: &[u8], max_dimension: u32) -> Result<(ImageInfo, Vec<u8>), String> {
+pub fn decode_i8_thumbnail_png(
+    data: &[u8],
+    max_dimension: u32,
+) -> Result<(ImageInfo, Vec<u8>), String> {
     decode_thumbnail_png(data, max_dimension)
 }
 
@@ -544,9 +606,13 @@ pub fn decode_i8_thumbnail_reader<R: Read>(
     max_dimension: u32,
 ) -> Result<(ImageInfo, Vec<u8>), String> {
     let mut buffer = Vec::new();
-    buffer.try_reserve_exact(image_size).map_err(|e| format!("alloc failed: {e}"))?;
+    buffer
+        .try_reserve_exact(image_size)
+        .map_err(|e| format!("alloc failed: {e}"))?;
     buffer.resize(image_size, 0);
-    reader.read_exact(&mut buffer).map_err(|e| format!("read failed: {e}"))?;
+    reader
+        .read_exact(&mut buffer)
+        .map_err(|e| format!("read failed: {e}"))?;
     decode_thumbnail_png(&buffer, max_dimension)
 }
 
@@ -559,7 +625,8 @@ pub fn encode_png_to_template_detailed(
         return Err("PNG input exceeds the 64 MiB conversion limit".into());
     }
 
-    let template_info = inspect_image(template).ok_or_else(|| "unsupported image template format".to_string())?;
+    let template_info =
+        inspect_image(template).ok_or_else(|| "unsupported image template format".to_string())?;
 
     let width = u32::from(template_info.width);
     let height = u32::from(template_info.height);
@@ -618,7 +685,7 @@ pub fn encode_png_to_template_detailed(
                 bytes,
                 lossy_quantization: false,
             })
-        },
+        }
 
         ImageFormatKind::Jpeg => {
             let mut cursor = Cursor::new(Vec::new());
@@ -698,8 +765,12 @@ pub fn encode_png_to_template_detailed(
 
             let rgba = image.into_raw();
             let orig_payload = if template_info.format.is_rle() {
-                let comp_len = u32::from_le_bytes([template[16], template[17], template[18], template[19]]) as usize;
-                let raw_len = u32::from_le_bytes([template[20], template[21], template[22], template[23]]) as usize;
+                let comp_len =
+                    u32::from_le_bytes([template[16], template[17], template[18], template[19]])
+                        as usize;
+                let raw_len =
+                    u32::from_le_bytes([template[20], template[21], template[22], template[23]])
+                        as usize;
                 rle_decompress(&template[24..24 + comp_len], raw_len)
             } else {
                 template[12..].to_vec()
@@ -707,7 +778,13 @@ pub fn encode_png_to_template_detailed(
 
             let mut orig_lookup = HashMap::<Rgba, u8>::with_capacity(256);
             if orig_payload.len() >= PALETTE_BYTES_I8 {
-                for (idx, entry) in orig_payload[..PALETTE_BYTES_I8].as_chunks::<4>().0.iter().enumerate().rev() {
+                for (idx, entry) in orig_payload[..PALETTE_BYTES_I8]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .rev()
+                {
                     orig_lookup.insert([entry[2], entry[1], entry[0], entry[3]], idx as u8);
                 }
             }
@@ -754,15 +831,23 @@ pub fn encode_png_to_template_detailed(
             };
 
             let mut raw_payload = orig_payload;
-            if raw_payload.len() < PALETTE_BYTES_I8 + usize::from(template_info.stride) * usize::from(template_info.height) {
-                raw_payload.resize(PALETTE_BYTES_I8 + usize::from(template_info.stride) * usize::from(template_info.height), 0);
+            if raw_payload.len()
+                < PALETTE_BYTES_I8
+                    + usize::from(template_info.stride) * usize::from(template_info.height)
+            {
+                raw_payload.resize(
+                    PALETTE_BYTES_I8
+                        + usize::from(template_info.stride) * usize::from(template_info.height),
+                    0,
+                );
             }
 
             if let Some(palette) = palette {
                 raw_payload[..PALETTE_BYTES_I8].fill(0);
                 for (i, color) in palette.into_iter().take(256).enumerate() {
                     let at = i * 4;
-                    raw_payload[at..at + 4].copy_from_slice(&[color[2], color[1], color[0], color[3]]);
+                    raw_payload[at..at + 4]
+                        .copy_from_slice(&[color[2], color[1], color[0], color[3]]);
                 }
             }
 
@@ -802,7 +887,8 @@ pub fn encode_png_to_template_detailed(
                 (palette, lookup, true)
             };
 
-            let mut raw_payload = vec![0u8; PALETTE_BYTES_I4 + stride * usize::from(template_info.height)];
+            let mut raw_payload =
+                vec![0u8; PALETTE_BYTES_I4 + stride * usize::from(template_info.height)];
             for (i, color) in palette.into_iter().take(16).enumerate() {
                 let at = i * 4;
                 raw_payload[at..at + 4].copy_from_slice(&[color[2], color[1], color[0], color[3]]);
@@ -947,7 +1033,8 @@ pub fn encode_png_to_template(
     template: &[u8],
     allow_quantize: bool,
 ) -> Result<Vec<u8>, String> {
-    encode_png_to_template_detailed(png_bytes, template, allow_quantize).map(|encoded| encoded.bytes)
+    encode_png_to_template_detailed(png_bytes, template, allow_quantize)
+        .map(|encoded| encoded.bytes)
 }
 
 pub fn encode_png_i8(
@@ -1120,9 +1207,15 @@ mod tests {
         }));
         let encoded = encode_png_to_template_detailed(&png, &template, false).unwrap();
         assert!(!encoded.lossy_quantization);
-        assert_eq!(&encoded.bytes[..HEADER_BYTES_V9], &template[..HEADER_BYTES_V9]);
+        assert_eq!(
+            &encoded.bytes[..HEADER_BYTES_V9],
+            &template[..HEADER_BYTES_V9]
+        );
         let pixel_offset = HEADER_BYTES_V9 + PALETTE_BYTES_I8;
-        assert_eq!(&encoded.bytes[pixel_offset..], &[1, 2, 77, 88, 3, 0, 99, 111]);
+        assert_eq!(
+            &encoded.bytes[pixel_offset..],
+            &[1, 2, 77, 88, 3, 0, 99, 111]
+        );
         let (_, decoded) = decode_to_rgba(&encoded.bytes).unwrap();
         assert_eq!(decoded.dimensions(), (2, 2));
         assert_eq!(decoded.pixels().copied().collect::<Vec<_>>(), colors);
@@ -1159,7 +1252,11 @@ mod tests {
                 0x10 => ImageFormatKind::Lvgl9Argb8888Rle,
                 _ => unreachable!(),
             };
-            templates.push(assemble_lvgl9_output(&template, info, &template[HEADER_BYTES_V9..]));
+            templates.push(assemble_lvgl9_output(
+                &template,
+                info,
+                &template[HEADER_BYTES_V9..],
+            ));
             templates.push(template);
         }
         for (cf, payload_bytes) in [(4u32, 8), (10, PALETTE_BYTES_I8 + 4)] {
@@ -1219,7 +1316,10 @@ mod tests {
     fn same_size_png_template_preserves_input_bytes() {
         let input = png_bytes(RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 4])));
         let template = png_bytes(RgbaImage::new(2, 2));
-        assert_eq!(encode_png_to_template(&input, &template, false).unwrap(), input);
+        assert_eq!(
+            encode_png_to_template(&input, &template, false).unwrap(),
+            input
+        );
     }
 
     #[test]
@@ -1371,7 +1471,8 @@ mod tests {
             .write_to(&mut cursor, ImageFormat::Png)
             .unwrap();
         assert!(encode_png_to_template(cursor.get_ref(), &template, false).is_err());
-        let quantized = encode_png_to_template_detailed(&cursor.into_inner(), &template, true).unwrap();
+        let quantized =
+            encode_png_to_template_detailed(&cursor.into_inner(), &template, true).unwrap();
         assert!(quantized.lossy_quantization);
         assert_eq!(inspect_image(&quantized.bytes).unwrap().width, 257);
     }

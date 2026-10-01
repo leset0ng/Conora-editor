@@ -4,15 +4,15 @@
 
 ## Platform
 
-web
+web and native CLI
 
 ## Stack
 
-delegated: AstroBox NG API Level 4 Rust plugin, `wasm32-wasip2` standard library, AstroBox UI v3 and host dialogs.
+Shared Rust `conora-core`, a native `conora` CLI, and an AstroBox NG API Level 4 Rust plugin using `wasm32-wasip2`, AstroBox UI v3 and host dialogs.
 
 ## Users
 
-AstroBox users who create or customize Canopus/Conora resource packs for Xiaomi Band 11 firmware.
+AstroBox users and coding agents who create or customize Canopus/Conora resource packs for watch firmware, including Xiaomi Band 11.
 
 ## Product Purpose
 
@@ -28,7 +28,9 @@ The user selects a local OTA firmware archive, browses its resource tree, select
 
 ## Capabilities and Constraints
 
-- Initial validation target is the supplied Xiaomi Band 11 firmware `4.100.155`.
+- Initial real-device validation target is the supplied Xiaomi Band 11 firmware `4.100.155`; synthetic tests cover multiple firmware paths, sizes and image formats.
+- CLI themes share logical icon roles and source assets across targets. Each target stores bindings and the complete firmware SHA-256, never per-resource hashes; optional target asset overrides support differing layouts. Builds produce separate CRPack v1 outputs, not a multi-firmware container.
+- CLI operations are non-interactive, support JSON diagnostics, refuse implicit output overwrite and protect source firmware/configs/assets. All selected targets must validate before outputs are published; each output is atomically committed, but multi-file commits are not a filesystem transaction.
 - The input OTA is a ZIP/JAR containing `vela_resource.bin`, which contains a ROMFS resource tree.
 - Automatic image preview and bidirectional PNG conversion support LVGL v9 (I8, A8, ARGB8888, I4, A4; uncompressed and RLE-compressed), LVGL v8 (RGB565, I8), PNG, and JPEG; PNG inputs with the same aspect ratio are automatically scaled to the source template dimensions using nearest-neighbor sampling; mismatched aspect ratios are rejected without padding, cropping, or stretching. Same-size inputs are not resampled. PNG inputs are limited to 64 MiB and 16 * 1024 * 1024 pixels. Lossy quantization must be explicit.
 - Non-image replacements are copied as file bytes; their device-specific format is not inferred or certified.
@@ -44,7 +46,8 @@ The user selects a local OTA firmware archive, browses its resource tree, select
 
 ## Product Principles
 
-- Keep firmware analysis local to the plugin.
+- Keep firmware analysis local to the editor or CLI; do not require a model service.
+- Separate reusable theme design from firmware-specific resource bindings; never infer compatibility solely from filenames or advisory targets.
 - Preserve source paths; export only intentional replacements.
 - Refuse malformed archives, unsafe paths, unsupported image layouts, and CRPack limit violations rather than silently repairing them.
 - Distinguish validated format support from generic binary replacement.
