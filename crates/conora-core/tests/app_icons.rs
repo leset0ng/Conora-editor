@@ -204,10 +204,11 @@ fn quickapp_rules_share_count_and_tsv_budgets_with_mappings() {
 }
 
 #[test]
-fn raw_icons_require_actual_lvgl_bin_and_pngs_require_quickapp_templates() {
+fn raw_icons_require_actual_lvgl_bin_and_pngs_allow_optional_quickapp_templates() {
     let (_, png) = conora_core::lvgl::decode_image_png(&app_icons::canopus_template()).unwrap();
     assert!(app_icons::encode(&png, None, false, true, false).is_err());
-    assert!(app_icons::encode(&png, None, false, false, false).is_err());
+    let quickapp = app_icons::encode(&png, None, false, false, false).unwrap();
+    assert_eq!(quickapp, app_icons::canopus_template());
     let encoded = app_icons::encode(&png, None, true, false, false).unwrap();
     assert_eq!(encoded, app_icons::canopus_template());
     assert!(app_icons::encode(&png, Some(&png), false, false, false).is_err());
@@ -319,4 +320,55 @@ fn both_quickapp_declarations_and_semantic_mapping_sources_enforce_wire_safety()
         let bytes = crpack::build_crpack_with_mappings(&options(&files), &mappings, &[]).unwrap();
         assert_eq!(crpack::parse_crpack(&bytes).unwrap().mappings, mappings);
     }
+}
+
+#[test]
+fn template_free_quickapp_encoding_ignores_resize_and_quantize_options() {
+    use conora_core::lvgl::{self, ResizeFilter};
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    let image = RgbaImage::from_fn(257, 1, |x, _| Rgba([x as u8, (x / 256) as u8, 91, x as u8]));
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image.clone())
+        .write_to(&mut png, ImageFormat::Png)
+        .unwrap();
+    let expected = lvgl::encode_png_argb8888(png.get_ref()).unwrap();
+    for allow_quantize in [false, true] {
+        let encoded =
+            app_icons::encode_detailed(png.get_ref(), None, false, false, allow_quantize).unwrap();
+        assert_eq!(encoded, expected);
+        for filter in [
+            ResizeFilter::Nearest,
+            ResizeFilter::Lanczos3,
+            ResizeFilter::Triangle,
+        ] {
+            let bytes = app_icons::encode_with_filter(
+                png.get_ref(),
+                None,
+                false,
+                false,
+                allow_quantize,
+                filter,
+            )
+            .unwrap();
+            assert_eq!(bytes, expected.bytes);
+            assert_eq!(lvgl::decode_to_rgba(&bytes).unwrap().1, image);
+        }
+    }
+    // An explicit template still enforces its existing aspect-ratio contract.
+    assert!(
+        app_icons::encode(
+            png.get_ref(),
+            Some(&app_icons::canopus_template()),
+            false,
+            false,
+            false
+        )
+        .unwrap_err()
+        .contains("aspect ratio")
+    );
+    assert!(
+        app_icons::encode(png.get_ref(), None, true, false, false)
+            .unwrap_err()
+            .contains("aspect ratio")
+    );
 }

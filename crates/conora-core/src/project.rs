@@ -824,7 +824,7 @@ fn prepare_app_icon(
         }
         if replacements.contains_key(&destination) {
             return Err(format!(
-                "application icon destination conflicts with firmware replacement: {destination}"
+                "application icon destination conflicts with an existing replacement: {destination}"
             ));
         }
         if asset.input.as_os_str().is_empty() {
@@ -855,6 +855,8 @@ fn prepare_app_icon(
             *template_bytes += bytes.len();
             Some(bytes)
         } else {
+            // Template-free QuickApp PNGs use their own dimensions and consume
+            // no original-template budget. Raw icons also need no template.
             None
         };
         let encoded = app_icons::encode_detailed_with_filter(

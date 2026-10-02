@@ -10,7 +10,7 @@ use super::{Failure, Result};
 
 #[derive(Subcommand)]
 pub(super) enum IconCommand {
-    /// Copy an icon (and PNG encoding template) into the theme project.
+    /// Copy an icon (and optional PNG encoding template) into the theme project.
     Set(Set),
     /// List configured native icons, without loading firmware.
     Ls(List),
@@ -41,7 +41,7 @@ pub(super) struct Set {
     /// Copy bytes unchanged; cannot be combined with --template.
     #[arg(long, conflicts_with = "template")]
     raw: bool,
-    /// Original native icon encoding template (required for PNG conversion).
+    /// Original LVGL BIN template; QuickApp PNGs otherwise retain their dimensions as ARGB8888.
     #[arg(long)]
     template: Option<PathBuf>,
     /// Explicitly permit palette quantization during PNG conversion.
@@ -160,7 +160,13 @@ pub(super) fn run(command: IconCommand) -> Result<Value> {
 fn mutate(
     theme_argument: &Path,
     selector: Selector,
-    set: Option<(PathBuf, bool, Option<PathBuf>, bool, conora_core::ResizeFilter)>,
+    set: Option<(
+        PathBuf,
+        bool,
+        Option<PathBuf>,
+        bool,
+        conora_core::ResizeFilter,
+    )>,
 ) -> Result<Value> {
     if let Some(package) = &selector.package {
         conora_core::app_icons::validate_package(package)?;
@@ -198,12 +204,6 @@ fn mutate(
         super::path_text(&input)?;
         if let Some(path) = &template_path {
             super::path_text(path)?;
-        }
-        if !raw && !selector.canopus && template_path.is_none() {
-            return Err(Failure::new(
-                "template_required",
-                "QuickApp PNG conversion requires --template original.bin",
-            ));
         }
         let bytes = project::read_limited(&input, project::MAX_TEMPLATE_BYTES)?;
         let template = template_path

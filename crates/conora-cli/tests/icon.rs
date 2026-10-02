@@ -230,7 +230,7 @@ fn invalid_selectors_templates_inputs_and_packages_do_not_mutate_config() {
             "set",
             "--package",
             "org.app",
-            "source.png",
+            "firmware.bin",
             "--theme",
             "theme",
         ],
@@ -642,4 +642,126 @@ fn custom_resize_filter_records_in_theme_json() {
     );
     let theme = config(root);
     assert_eq!(theme["canopusIcon"]["filter"], "nearest");
+}
+
+#[test]
+fn template_free_quickapp_png_set_check_preview_verify_build_preserves_rgba() {
+    use conora_core::lvgl;
+    let dir = fixture();
+    let root = dir.path();
+    let image = RgbaImage::from_fn(301, 2, |x, y| {
+        Rgba([x as u8, (x / 256) as u8, 73, (x + y) as u8])
+    });
+    image.save(root.join("source.png")).unwrap();
+    run(
+        root,
+        &[
+            "icon",
+            "set",
+            "--package",
+            "org.own",
+            "source.png",
+            "--filter",
+            "nearest",
+            "--theme",
+            "theme",
+        ],
+        0,
+    );
+    let theme = config(root);
+    assert!(theme["quickappIcons"]["org.own"].get("template").is_none());
+    fs::remove_file(root.join("source.png")).unwrap();
+    fs::remove_file(root.join("original.bin")).unwrap();
+    run(root, &["check", "--theme", "theme", "--target", "A"], 0);
+    run(
+        root,
+        &["preview", "--theme", "theme", "--target", "A", "--verify"],
+        0,
+    );
+    let previews = root.join("theme/previews");
+    let index: Value =
+        serde_json::from_slice(&fs::read(previews.join("preview_index-A.json")).unwrap()).unwrap();
+    assert_eq!(index["verified"], true);
+    let resource = &index["resources"][0];
+    assert_eq!(
+        resource["verification"]["contract"],
+        "sourceDimensionsArgb8888"
+    );
+    for field in ["sameMetadata", "sameHeader", "samePixels"] {
+        assert_eq!(resource["verification"][field], true);
+    }
+    assert_eq!(
+        image::open(previews.join(resource["png"].as_str().unwrap()))
+            .unwrap()
+            .to_rgba8(),
+        image
+    );
+    run(root, &["build", "--theme", "theme", "--target", "A"], 0);
+    let pack =
+        crpack::parse_crpack(&fs::read(root.join("theme/dist/conora-A.crpack")).unwrap()).unwrap();
+    let encoded = &pack.replacements[&app_icons::destination("org.own")];
+    let (info, actual) = lvgl::decode_to_rgba(encoded).unwrap();
+    assert_eq!(info.format, lvgl::ImageFormatKind::Lvgl9Argb8888);
+    assert_eq!((info.width, info.height, info.stride), (301, 2, 1204));
+    assert_eq!(actual, image);
+}
+
+#[test]
+fn template_free_quickapp_png_size_and_decode_failures_do_not_publish() {
+    let dir = fixture();
+    let root = dir.path();
+    let before = fs::read(root.join("theme/theme.json")).unwrap();
+    let png = fs::read(root.join("source.png")).unwrap();
+    let mut inputs = vec![b"not a PNG".to_vec(), png[..png.len() / 2].to_vec()];
+    for (width, height) in [(16384u32, 1u32), (1, 65536), (4097, 4097), (0, 1)] {
+        let mut input = png.clone();
+        input[16..20].copy_from_slice(&width.to_be_bytes());
+        input[20..24].copy_from_slice(&height.to_be_bytes());
+        let mut crc = u32::MAX;
+        for &byte in &input[12..29] {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        input[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        inputs.push(input);
+    }
+    for input in inputs {
+        fs::write(root.join("invalid.png"), input).unwrap();
+        run(
+            root,
+            &[
+                "icon",
+                "set",
+                "--package",
+                "org.invalid",
+                "invalid.png",
+                "--theme",
+                "theme",
+            ],
+            1,
+        );
+        assert_eq!(fs::read(root.join("theme/theme.json")).unwrap(), before);
+        assert!(!root.join("theme/assets/native-icons").exists());
+    }
+    fs::File::create(root.join("oversized.png"))
+        .unwrap()
+        .set_len(conora_core::project::MAX_TEMPLATE_BYTES as u64 + 1)
+        .unwrap();
+    run(
+        root,
+        &[
+            "icon",
+            "set",
+            "--package",
+            "org.invalid",
+            "oversized.png",
+            "--theme",
+            "theme",
+        ],
+        1,
+    );
+    assert_eq!(fs::read(root.join("theme/theme.json")).unwrap(), before);
+    assert!(!root.join("theme/assets/native-icons").exists());
 }

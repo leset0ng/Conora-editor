@@ -42,16 +42,16 @@ Existing packs can be imported with `conora import pack.crpack --into ./theme --
 ```bash
 # Canopus uses the known 117x117 LVGL v9 ARGB8888 layout by default.
 conora icon set --canopus ./canopus.png --theme ./my-icons
-# QuickApp PNG conversion requires the application's original LVGL BIN template.
+# QuickApp PNGs need no template: retain their dimensions and alpha as LVGL v9 ARGB8888.
 conora icon set --package ng.lst.corona ./corona.png \
-  --template ./original-icon.bin --theme ./my-icons
+  --theme ./my-icons
 conora icon ls --theme ./my-icons --json
 conora icon remove --package ng.lst.corona --theme ./my-icons
 ```
 
-Use `--raw` for an already encoded, supported LVGL BIN. Commands copy assets into the project and update declarations; existing `check`, `preview --verify`, and `build` include these icons without ordinary firmware bindings. Targets can override application assets/templates in their configs. CLI builds still use explicit fingerprinted firmware targets. The plugin's **Third-party application icons** section can import, preview, replace, and export these icons without loading firmware.
+QuickApp PNGs without `--template` are encoded losslessly at their own dimensions as uncompressed LVGL v9 ARGB8888, retaining alpha. An optional original LVGL BIN template preserves the existing proportional-resize/layout behavior. Use `--raw` for an already encoded, supported LVGL BIN. Commands copy assets into the project and update declarations; existing `check`, `preview --verify`, and `build` include these icons without ordinary firmware bindings. Targets can override application assets/templates in their configs. CLI builds still use explicit fingerprinted firmware targets. The plugin's **Third-party application icons** section can import, preview, replace, and export these icons without loading firmware.
 
-Canopus exports an exact mapping from `/data/canopus/manager_icon.bin`; QuickApps export optional `quickappIcons` entries with `package` and a safe archive-relative `.bin` `destination`. Both share the existing CRPack path, rule-count, manifest, TSV, and total-byte limits. Import/re-export preserves these declarations, including normalized `@quickapp-icon/<package>` rules. Package identifiers are opaque exact strings (even empty, Unicode or containing spaces/slashes), never trimmed or treated as paths. Only the 255-byte UTF-8 source budget and forbidden TSV bytes 0–31/127 apply. New QuickApp destinations use `quickapp-icons/<sha256-of-package-UTF8>.bin`; imported safe destinations may be shared by multiple icons.
+Canopus exports an exact mapping from `/data/canopus/manager_icon.bin`; QuickApps export optional `quickappIcons` entries with `package` and a safe archive-relative `.bin` `destination`. Both share the existing CRPack path, rule-count, manifest, TSV, and total-byte limits. Import/re-export preserves these declarations, including normalized `@quickapp-icon/<package>` rules. Package identifiers are opaque exact strings (even empty, Unicode or containing spaces/slashes), never trimmed or treated as paths. Only the 255-byte UTF-8 source budget and forbidden TSV bytes 0–31/127 apply. New QuickApp destinations use `quickapp-icons/<16-hex-hash>.bin`; imported safe destinations may be shared by multiple icons.
 
 QuickApp icon application requires an updated device Manager/module and an approved exact device target; the current sibling contract supports Band 11 `.139/.155`, not `.043` or PNG/in-memory source icons. Old receivers may ignore this optional field. The Canopus preset is a layout-only template, not the original artwork, and is not a compatibility claim for other devices; supply an explicit template for another layout. Creating a pack neither installs applications nor writes device files, and successful encoding does not prove Launcher refresh on a watch.
 

@@ -150,7 +150,7 @@ fn application_icons_build_without_firmware_bindings_and_support_target_template
 }
 
 #[test]
-fn app_icon_validation_collects_missing_templates_and_invalid_raw_inputs() {
+fn app_icon_validation_collects_missing_explicit_templates_and_invalid_raw_inputs() {
     let directory = project();
     target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
     write_json(
@@ -158,7 +158,7 @@ fn app_icon_validation_collects_missing_templates_and_invalid_raw_inputs() {
         &json!({
             "themeId":"dark", "name":"App icons", "icons":{},
             "canopusIcon":{"input":"assets/icon.png", "mode":"raw"},
-            "quickappIcons":{"ng.lst.corona":{"input":"assets/icon.png"}}
+            "quickappIcons":{"ng.lst.corona":{"input":"assets/icon.png", "template":"assets/missing.bin"}}
         }),
     );
     let mut config: Value =
@@ -845,4 +845,52 @@ fn aggregate_source_assets_are_bounded_even_when_each_file_is_within_its_limit()
     );
     assert_eq!(built.report.resources.len(), 1);
     assert!(built.pack.is_none());
+}
+
+#[test]
+fn template_free_quickapp_project_build_retains_source_dimensions_and_alpha() {
+    let directory = project();
+    target(
+        directory.path(),
+        "A",
+        "icons",
+        b"unrelated firmware resource",
+        1,
+    );
+    let mut target_config: Value =
+        serde_json::from_slice(&fs::read(directory.path().join("targets/A.json")).unwrap())
+            .unwrap();
+    target_config["bindings"] = json!({});
+    // Target overrides can also omit a template.
+    target_config["quickappIcons"] =
+        json!({"org.app": {"input":"assets/own.png", "filter":"nearest"}});
+    write_json(&directory.path().join("targets/A.json"), &target_config);
+    let image = RgbaImage::from_fn(301, 2, |x, y| {
+        Rgba([x as u8, (x / 256) as u8, 39, (x + y) as u8])
+    });
+    image.save(directory.path().join("assets/own.png")).unwrap();
+    write_json(
+        &directory.path().join("theme.json"),
+        &json!({
+            "themeId":"dark", "name":"Own dimensions", "icons":{},
+            "quickappIcons":{
+                "org.app":{"input":"assets/icon.png", "template":"assets/missing.bin"},
+                "org.shared":{"input":"assets/own.png"}
+            }
+        }),
+    );
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    assert_eq!(built.report.resources.len(), 2);
+    for summary in &built.report.resources {
+        assert_eq!(summary.format.as_deref(), Some("LVGL v9 ARGB8888"));
+        assert_eq!((summary.width, summary.height), (Some(301), Some(2)));
+        assert!(!summary.lossy);
+    }
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert!(pack.mappings.is_empty());
+    for package in ["org.app", "org.shared"] {
+        let bytes = &pack.replacements[&conora_core::app_icons::destination(package)];
+        assert_eq!(lvgl::decode_to_rgba(bytes).unwrap().1, image);
+    }
 }

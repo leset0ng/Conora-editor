@@ -77,7 +77,6 @@ impl std::str::FromStr for ResizeFilter {
     }
 }
 
-
 type Rgba = [u8; 4];
 
 fn pixel_color(pixel: &[u8; 4]) -> Rgba {
@@ -735,17 +734,81 @@ pub fn decode_i8_thumbnail_reader<R: Read>(
     decode_thumbnail_png(&buffer, max_dimension)
 }
 
+fn png_dimensions_bounded(png_bytes: &[u8]) -> Result<(u32, u32), String> {
+    if png_bytes.len() > MAX_PNG_BYTES {
+        return Err("PNG input exceeds the 64 MiB conversion limit".into());
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_PIXELS as u32);
+    limits.max_image_height = Some(MAX_IMAGE_PIXELS as u32);
+    limits.max_alloc = Some(MAX_IMAGE_PIXELS * 16 + 1024 * 1024);
+    let mut reader = ImageReader::with_format(Cursor::new(png_bytes), ImageFormat::Png);
+    reader.limits(limits.clone());
+    let (source_width, source_height) = reader
+        .into_dimensions()
+        .map_err(|error| format!("PNG decode failed: {error}"))?;
+    let source_pixels = u64::from(source_width) * u64::from(source_height);
+    if source_width == 0 || source_height == 0 || source_pixels > MAX_IMAGE_PIXELS {
+        return Err("PNG dimensions exceed the 16-megapixel conversion limit".into());
+    }
+    Ok((source_width, source_height))
+}
+
+fn decode_png_bounded(png_bytes: &[u8], width: u32, height: u32) -> Result<RgbaImage, String> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(u64::from(width) * u64::from(height) * 16 + 1024 * 1024);
+    let mut reader = ImageReader::with_format(Cursor::new(png_bytes), ImageFormat::Png);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map(|image| image.to_rgba8())
+        .map_err(|error| format!("PNG decode failed: {error}"))
+}
+
+/// Encode a PNG at its own dimensions as uncompressed LVGL v9 ARGB8888.
+/// Pixels retain all RGBA channels; the native payload stores them in BGRA order.
+pub fn encode_png_argb8888(png_bytes: &[u8]) -> Result<EncodedImage, String> {
+    let (width, height) = png_dimensions_bounded(png_bytes)?;
+    // Validate every 16-bit header field before decoding or allocating pixels.
+    let header_width = u16::try_from(width).map_err(|_| "PNG width exceeds LVGL v9 limit")?;
+    let header_height = u16::try_from(height).map_err(|_| "PNG height exceeds LVGL v9 limit")?;
+    let stride = width
+        .checked_mul(4)
+        .and_then(|stride| u16::try_from(stride).ok())
+        .ok_or("PNG row stride exceeds the LVGL v9 16-bit limit")?;
+    let payload_len = usize::from(stride)
+        .checked_mul(usize::from(header_height))
+        .ok_or("PNG payload size exceeds conversion limits")?;
+    let output_len = HEADER_BYTES_V9
+        .checked_add(payload_len)
+        .ok_or("PNG output size exceeds conversion limits")?;
+    let image = decode_png_bounded(png_bytes, width, height)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(output_len)
+        .map_err(|e| format!("alloc failed: {e}"))?;
+    bytes.extend_from_slice(&[0x19, 0x10, 0, 0]);
+    bytes.extend_from_slice(&header_width.to_le_bytes());
+    bytes.extend_from_slice(&header_height.to_le_bytes());
+    bytes.extend_from_slice(&stride.to_le_bytes());
+    bytes.extend_from_slice(&[0, 0]);
+    for pixel in image.pixels() {
+        bytes.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    }
+    Ok(EncodedImage {
+        bytes,
+        lossy_quantization: false,
+    })
+}
+
 pub fn encode_png_to_template_detailed(
     png_bytes: &[u8],
     template: &[u8],
     allow_quantize: bool,
 ) -> Result<EncodedImage, String> {
-    encode_png_to_template_with_filter(
-        png_bytes,
-        template,
-        allow_quantize,
-        ResizeFilter::default(),
-    )
+    encode_png_to_template_with_filter(png_bytes, template, allow_quantize, ResizeFilter::default())
 }
 
 pub fn encode_png_to_template_with_filter(
@@ -768,34 +831,14 @@ pub fn encode_png_to_template_with_filter(
         return Err("image template dimensions exceed conversion limits".into());
     }
 
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_PIXELS as u32);
-    limits.max_image_height = Some(MAX_IMAGE_PIXELS as u32);
-    limits.max_alloc = Some(MAX_IMAGE_PIXELS * 16 + 1024 * 1024);
-    let mut reader = ImageReader::with_format(Cursor::new(png_bytes), ImageFormat::Png);
-    reader.limits(limits.clone());
-    let (source_width, source_height) = reader
-        .into_dimensions()
-        .map_err(|error| format!("PNG decode failed: {error}"))?;
-    let source_pixels = u64::from(source_width) * u64::from(source_height);
-    if source_width == 0 || source_height == 0 || source_pixels > MAX_IMAGE_PIXELS {
-        return Err("PNG dimensions exceed the 16-megapixel conversion limit".into());
-    }
+    let (source_width, source_height) = png_dimensions_bounded(png_bytes)?;
     if u64::from(source_width) * u64::from(height) != u64::from(source_height) * u64::from(width) {
         return Err(format!(
             "PNG aspect ratio does not match the original image ({source_width}x{source_height} -> {width}x{height}); only proportional resizing is supported"
         ));
     }
 
-    limits.max_image_width = Some(source_width);
-    limits.max_image_height = Some(source_height);
-    limits.max_alloc = Some(source_pixels * 16 + 1024 * 1024);
-    let mut reader = ImageReader::with_format(Cursor::new(png_bytes), ImageFormat::Png);
-    reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|error| format!("PNG decode failed: {error}"))?
-        .to_rgba8();
+    let image = decode_png_bounded(png_bytes, source_width, source_height)?;
     let resized = (source_width, source_height) != (width, height);
     let image = if resized {
         image::imageops::resize(&image, width, height, filter.to_image_filter())
@@ -1331,6 +1374,92 @@ mod tests {
     }
 
     #[test]
+    fn template_free_argb8888_preserves_dimensions_native_bgra_and_alpha() {
+        let image = RgbaImage::from_fn(301, 2, |x, y| {
+            image::Rgba([x as u8, (x / 256) as u8, 37, (x + y) as u8])
+        });
+        let encoded = encode_png_argb8888(&png_bytes(image.clone())).unwrap();
+        assert!(!encoded.lossy_quantization);
+        assert_eq!(encoded.bytes.len(), 12 + 301 * 2 * 4);
+        let mut header = vec![0x19, 0x10, 0, 0];
+        header.extend_from_slice(&301u16.to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
+        header.extend_from_slice(&1204u16.to_le_bytes());
+        header.extend_from_slice(&[0, 0]);
+        assert_eq!(encoded.bytes[..12], header);
+        for (native, pixel) in encoded.bytes[12..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(image.pixels())
+        {
+            assert_eq!(*native, [pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+        let (info, actual) = decode_to_rgba(&encoded.bytes).unwrap();
+        assert_eq!(info.format, ImageFormatKind::Lvgl9Argb8888);
+        assert_eq!((info.width, info.height, info.stride), (301, 2, 1204));
+        assert_eq!(actual, image);
+    }
+
+    fn png_with_header_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut input = png_bytes(RgbaImage::new(1, 1));
+        input[16..20].copy_from_slice(&width.to_be_bytes());
+        input[20..24].copy_from_slice(&height.to_be_bytes());
+        let mut crc = u32::MAX;
+        for &byte in &input[12..29] {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        input[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        input
+    }
+
+    #[test]
+    fn template_free_argb8888_rejects_unrepresentable_headers_before_pixel_decode() {
+        for (width, height, message) in [
+            (16384, 1, "stride"),
+            (65536, 1, "width"),
+            (1, 65536, "height"),
+            (4097, 4097, "16-megapixel"),
+        ] {
+            // Only one pixel of compressed data: a decode attempt would fail.
+            let input = png_with_header_dimensions(width, height);
+            let error = encode_png_argb8888(&input).unwrap_err();
+            assert!(error.contains(message), "unexpected error: {error}");
+        }
+        for (width, height) in [(0, 1), (1, 0)] {
+            assert!(encode_png_argb8888(&png_with_header_dimensions(width, height)).is_err());
+        }
+    }
+
+    #[test]
+    fn template_free_argb8888_accepts_maximum_header_fields() {
+        for (width, height) in [(16383, 1), (1, 65535)] {
+            let image = RgbaImage::from_pixel(width, height, image::Rgba([11, 22, 33, 44]));
+            let encoded = encode_png_argb8888(&png_bytes(image.clone())).unwrap();
+            assert_eq!(decode_to_rgba(&encoded.bytes).unwrap().1, image);
+        }
+    }
+
+    #[test]
+    fn template_free_argb8888_rejects_oversized_and_malformed_pngs() {
+        let oversized = vec![0; MAX_PNG_BYTES + 1];
+        assert!(
+            encode_png_argb8888(&oversized)
+                .unwrap_err()
+                .contains("64 MiB")
+        );
+        assert!(encode_png_argb8888(b"not a PNG").is_err());
+        let png = png_bytes(RgbaImage::new(2, 1));
+        assert!(encode_png_argb8888(&png[..png.len() / 2]).is_err());
+        let mut corrupt = png;
+        corrupt[29] ^= 1;
+        assert!(encode_png_argb8888(&corrupt).is_err());
+    }
+
+    #[test]
     fn proportional_downscale_preserves_pixels_header_and_stride_padding() {
         let template = sample_template();
         let colors = [
@@ -1342,7 +1471,9 @@ mod tests {
         let png = png_bytes(RgbaImage::from_fn(4, 4, |x, y| {
             colors[(y / 2 * 2 + x / 2) as usize]
         }));
-        let encoded = encode_png_to_template_with_filter(&png, &template, false, ResizeFilter::Nearest).unwrap();
+        let encoded =
+            encode_png_to_template_with_filter(&png, &template, false, ResizeFilter::Nearest)
+                .unwrap();
         assert!(!encoded.lossy_quantization);
         assert_eq!(
             &encoded.bytes[..HEADER_BYTES_V9],
@@ -1364,7 +1495,10 @@ mod tests {
         let pixel = image::Rgba([255, 0, 0, 255]);
         let png = png_bytes(RgbaImage::from_pixel(4, 4, pixel));
         let encoded = encode_png_to_template_detailed(&png, &template, false).unwrap();
-        assert_eq!(encoded.bytes[..HEADER_BYTES_V9], template[..HEADER_BYTES_V9]);
+        assert_eq!(
+            encoded.bytes[..HEADER_BYTES_V9],
+            template[..HEADER_BYTES_V9]
+        );
         assert_eq!(encoded.bytes.len(), template.len());
         assert!(!encoded.lossy_quantization);
         let (_, decoded) = decode_to_rgba(&encoded.bytes).unwrap();

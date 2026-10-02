@@ -39,13 +39,10 @@ pub fn validate_package(package: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Keep the exact identifier out of paths. The fixed-size SHA-256 filename also
-/// leaves room for the device theme root and the maximum-length theme ID.
+/// Keep exact identifiers out of paths using a short, deterministic 64-bit hash.
 pub fn destination(package: &str) -> String {
-    format!(
-        "quickapp-icons/{:x}.bin",
-        Sha256::digest(package.as_bytes())
-    )
+    let hash = format!("{:x}", Sha256::digest(package.as_bytes()));
+    format!("quickapp-icons/{}.bin", &hash[..16])
 }
 
 pub fn source(package: &str) -> String {
@@ -97,7 +94,7 @@ pub fn encode_detailed_with_filter(
             preset = canopus_template();
             &preset
         }
-        None => return Err("PNG QuickApp icons require an original BIN template".into()),
+        None => return lvgl::encode_png_argb8888(input),
     };
     inspect_bin(template)?;
     lvgl::encode_png_to_template_with_filter(input, template, allow_quantize, filter)
@@ -180,14 +177,11 @@ mod tests {
 
     #[test]
     fn destinations_are_independent_safe_fixed_size_names() {
-        assert_eq!(
-            destination(""),
-            "quickapp-icons/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.bin"
-        );
+        assert_eq!(destination(""), "quickapp-icons/e3b0c44298fc1c14.bin");
         for package in ["ng.lst.corona", "../", "/", r"C:\foo", " a ", "快应用"] {
             let path = destination(package);
             crate::crpack::validate_relative_path(&path).unwrap();
-            assert_eq!(path.len(), "quickapp-icons/".len() + 64 + 4);
+            assert_eq!(path.len(), "quickapp-icons/".len() + 16 + 4);
             assert_eq!(path.matches('/').count(), 1);
             assert_eq!(path, destination(package));
         }

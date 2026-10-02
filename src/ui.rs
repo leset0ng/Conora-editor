@@ -1187,9 +1187,15 @@ fn insert_quickapp(state: &mut UiState) -> Result<(), String> {
     {
         return Err("此快应用标识已添加。".into());
     }
+    let destination = app_icons::destination(&package);
+    if icon_destinations(state).contains(destination.as_str())
+        || state.replacements.contains_key(&destination)
+    {
+        return Err("生成的图标路径已被占用；请先移除冲突项。".into());
+    }
     state.quickapps.push(QuickappEntry {
         declaration: QuickappIcon {
-            destination: app_icons::destination(&package),
+            destination,
             package,
         },
         template: None,
@@ -1203,8 +1209,7 @@ fn add_quickapp() {
     let mut state = lock_state();
     match insert_quickapp(&mut state) {
         Ok(()) => {
-            state.status =
-                "已添加快应用；PNG 替换需要原始 BIN 模板，也可直接替换 LVGL BIN。".into();
+            state.status = "已添加快应用。".into();
             state.error = None;
         }
         Err(error) => state.error = Some(format!("无法添加快应用：{error}")),
@@ -1332,13 +1337,6 @@ async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
             else {
                 return;
             };
-            if matches!(mode, IconPick::Png) && entry.template.is_none() {
-                state.error =
-                    Some("请先上传此快应用的原始 LVGL BIN 模板，或直接用 BIN 替换。".into());
-                drop(state);
-                render_current();
-                return;
-            }
             if matches!(mode, IconPick::Png) {
                 entry.template.clone()
             } else {
@@ -1426,15 +1424,9 @@ async fn begin_icon_pick(package: Option<&str>, mode: IconPick) {
                     set_shared_icon_asset(&mut state, &destination, bytes, package.is_none());
                 }
                 state.status = if matches!(mode, IconPick::Template) {
-                    format!(
-                        "已加载原始 BIN 模板（{}）；模板不计入替换项，也不会单独导出。",
-                        format_bytes(size)
-                    )
+                    format!("已加载模板（{}）。", format_bytes(size))
                 } else {
-                    format!(
-                        "已替换第三方应用图标（{}）；仅在导出 CRPack 时合并，不会操作设备。",
-                        format_bytes(size)
-                    )
+                    format!("已替换图标（{}）。", format_bytes(size))
                 };
                 state.error = None;
             }
@@ -2079,14 +2071,12 @@ fn lock_state() -> std::sync::MutexGuard<'static, UiState> {
 fn render_current() {
     let (root_id, tree) = {
         let mut state = lock_state();
-        (
-            state.root_element_id.clone(),
-            build_main_ui(snapshot(&mut state)),
-        )
+        let Some(root_id) = state.root_element_id.clone() else {
+            return;
+        };
+        (root_id, build_main_ui(snapshot(&mut state)))
     };
-    if let Some(root_id) = root_id {
-        psys_host::ui::render(&root_id, tree);
-    }
+    psys_host::ui::render(&root_id, tree);
 }
 
 pub fn render_main_ui(element_id: &str) {
@@ -2257,10 +2247,10 @@ fn build_app_icons(state: &UiSnapshot) -> ui::Element {
         .gap(8)
         .child(
             field(
-                "快应用标识（原样保留）",
+                "快应用包名",
                 &state.quickapp_package,
                 "icons.quickapp.package",
-                "任意标识，可为空；空格不裁剪",
+                "输入包名",
             )
             .flex_grow(1.0),
         )
@@ -2283,7 +2273,10 @@ fn build_app_icons(state: &UiSnapshot) -> ui::Element {
                 .on(ui::Event::Change, "pack.smooth_resize")
                 .disabled_if(state.busy),
         )
-        .child(text("启用平滑抗锯齿缩放（Lanczos3，未勾选时为像素最近邻）", 13));
+        .child(text(
+            "启用平滑抗锯齿缩放（Lanczos3，未勾选时为像素最近邻）",
+            13,
+        ));
     let quantize = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .align_center()
@@ -2304,14 +2297,19 @@ fn build_app_icons(state: &UiSnapshot) -> ui::Element {
         )
         .child(text("允许调色板颜色超限时进行有损量化（PNG 转换）", 13));
     ui::Element::new(ui::ElementType::Card, None)
-        .prop("variant", "surface").prop("size", "2").radius(24).padding(14)
-        .flex().flex_direction(ui::FlexDirection::Column).align_start().gap(10)
+        .prop("variant", "surface")
+        .prop("size", "2")
+        .radius(24)
+        .padding(14)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .align_start()
+        .gap(10)
         .child(text("第三方应用图标", 17))
-        .child(text("无需加载固件。Canopus 使用 117×117 LVGL v9 ARGB8888 预设；快应用 PNG 需要原始 BIN 模板，BIN 替换仅接受有效 LVGL 图像。", 13))
-        .child(text("注意：Canopus 预设仅适用于已知的 LVGL v9 117×117 ARGB8888 布局，不适用于 v8 或其他布局；其他设备/固件请确认原始格式，并直接使用匹配的 LVGL BIN。", 12))
-        .child(text("设备支持目前限小米手环 11 的 4.100.139 / 4.100.155，需新版资源替换模块支持。此处仅编辑并导出 CRPack，不会立即操作设备。", 12))
-        .child(text("快应用标识原样保留（含空格、斜杠或空值）；加上 @quickapp-icon/ 后最多 255 UTF-8 字节，不能含字节 0–31 或 127。", 12))
-        .child(add).child(smooth_resize).child(quantize).child(icons)
+        .child(add)
+        .child(smooth_resize)
+        .child(quantize)
+        .child(icons)
 }
 
 fn build_icon_card(icon: &IconSnapshot, canopus: bool, busy: bool) -> ui::Element {
@@ -2341,8 +2339,6 @@ fn build_icon_card(icon: &IconSnapshot, canopus: bool, busy: bool) -> ui::Elemen
             ),
             12,
         ));
-    } else if !canopus {
-        content = content.child(text("未加载原始 BIN 模板；可直接替换 BIN。", 12));
     }
     let preview = ui::Element::new(ui::ElementType::Div, None)
         .width_full()
@@ -2375,10 +2371,7 @@ fn build_icon_card(icon: &IconSnapshot, canopus: bool, busy: bool) -> ui::Elemen
         .grid_template_columns("repeat(2, 1fr)")
         .width_full()
         .gap(8)
-        .child(
-            button("用 PNG 替换", &event("png"), "soft", "accent")
-                .disabled_if(busy || (!canopus && icon.template_info.is_none())),
-        )
+        .child(button("用 PNG 替换", &event("png"), "soft", "accent").disabled_if(busy))
         .child(button("用 BIN 替换", &event("bin"), "soft", "gray").disabled_if(busy));
     if canopus {
         actions = actions.child(
@@ -2386,11 +2379,8 @@ fn build_icon_card(icon: &IconSnapshot, canopus: bool, busy: bool) -> ui::Elemen
                 .disabled_if(busy || icon.size.is_none()),
         );
     } else {
-        actions = actions
-            .child(
-                button("上传原始 BIN 模板", &event("template"), "soft", "gray").disabled_if(busy),
-            )
-            .child(button("移除", &event("remove"), "ghost", "gray").disabled_if(busy));
+        actions =
+            actions.child(button("移除", &event("remove"), "ghost", "gray").disabled_if(busy));
     }
     content = content.child(actions);
     ui::Element::new(ui::ElementType::Card, None)
@@ -2986,7 +2976,10 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
                     .align_center()
                     .gap(8)
                     .child(smooth_checkbox)
-                    .child(text("启用平滑抗锯齿缩放（Lanczos3，未勾选时为像素最近邻）", 13)),
+                    .child(text(
+                        "启用平滑抗锯齿缩放（Lanczos3，未勾选时为像素最近邻）",
+                        13,
+                    )),
             );
 
             let checkbox = ui::Element::new(ui::ElementType::Checkbox, None)
@@ -3168,6 +3161,41 @@ mod tests {
         assert_eq!(lock_state().resize_filter, lvgl::ResizeFilter::Nearest);
         process_change("pack.smooth_resize", r#"{"checked":"true"}"#);
         assert_eq!(lock_state().resize_filter, lvgl::ResizeFilter::Lanczos3);
+    }
+
+    #[test]
+    fn quickapp_png_exports_without_firmware_or_original_template() {
+        let mut state = UiState {
+            quickapp_package: "my-app".into(),
+            ..UiState::default()
+        };
+        insert_quickapp(&mut state).unwrap();
+        let (_, png) = lvgl::decode_image_png(&app_icons::canopus_template()).unwrap();
+        let bytes = app_icons::encode(&png, None, false, false, false).unwrap();
+        let destination = state.quickapps[0].declaration.destination.clone();
+        set_shared_icon_asset(&mut state, &destination, bytes, false);
+        assert!(state.quickapps[0].template.is_none());
+        let pack = crpack::parse_crpack(&build_project_pack(&state).unwrap()).unwrap();
+        assert_eq!(pack.quickapp_icons[0].package, "my-app");
+        assert_eq!(pack.quickapp_icons[0].destination, destination);
+        assert_eq!(destination.len(), "quickapp-icons/".len() + 16 + 4);
+        let info = app_icons::inspect_bin(&pack.replacements[&destination]).unwrap();
+        assert_eq!(info.format, lvgl::ImageFormatKind::Lvgl9Argb8888);
+        assert_eq!((info.width, info.height), (117, 117));
+    }
+
+    #[test]
+    fn new_quickapp_rejects_a_generated_path_already_owned_by_an_imported_icon() {
+        let mut state = UiState {
+            quickapp_package: "new-package".into(),
+            ..UiState::default()
+        };
+        let mut imported = quickapp("existing-package", true);
+        imported.declaration.destination = app_icons::destination("new-package");
+        state.quickapps.push(imported);
+        assert!(insert_quickapp(&mut state).is_err());
+        assert_eq!(state.quickapps.len(), 1);
+        assert_eq!(state.quickapp_package, "new-package");
     }
 
     #[test]

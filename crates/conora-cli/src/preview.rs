@@ -27,7 +27,7 @@ pub(super) struct Preview {
     /// Replace existing previews, but never project inputs.
     #[arg(long)]
     force: bool,
-    /// Also verify template metadata/header and nearest-resized source pixels.
+    /// Also verify template or source-dimension metadata/header and source pixels.
     #[arg(long)]
     verify: bool,
 }
@@ -395,20 +395,23 @@ fn verify_replacements(
             values.insert(path.clone(), json!({"status": "notApplicable", "reason": "raw replacements have no PNG conversion contract"}));
         } else if let Some(asset) = super::icon::asset(theme, &target, path)? {
             let original = if let Some(template) = asset["template"].as_str() {
-                project::read_limited(&theme.root.join(template), project::MAX_TEMPLATE_BYTES)?
+                Some(project::read_limited(
+                    &theme.root.join(template),
+                    project::MAX_TEMPLATE_BYTES,
+                )?)
             } else if path == conora_core::app_icons::CANOPUS_SOURCE {
-                conora_core::app_icons::canopus_template()
+                Some(conora_core::app_icons::canopus_template())
             } else {
-                return Err(Failure::new(
-                    "preview_verify",
-                    "native PNG icon has no template",
-                ));
+                None
             };
             let built = replacements
                 .get(&super::icon::archive_path(path))
                 .ok_or_else(|| Failure::new("preview_verify", "native replacement missing"))?;
-            let verified = verify_image(summary, &original, built)
-                .map_err(|e| Failure::new("preview_verify", format!("{path}: {e}")))?;
+            let verified = match original {
+                Some(original) => verify_image(summary, &original, built),
+                None => verify_template_free_icon(summary, built),
+            }
+            .map_err(|e| Failure::new("preview_verify", format!("{path}: {e}")))?;
             values.insert(path.clone(), verified);
         } else {
             paths.push(path.clone());
@@ -433,6 +436,46 @@ fn verify_replacements(
         )
         .map_err(|e| Failure::new("preview_verify", e))?;
     Ok(values)
+}
+
+fn verify_template_free_icon(
+    summary: &project::ResourceSummary,
+    built: &[u8],
+) -> std::result::Result<Value, String> {
+    let source = project::read_limited(&summary.input, project::MAX_TEMPLATE_BYTES)?;
+    let source = raster_bounded(&source)?;
+    let width = u16::try_from(source.width()).map_err(|_| "source width exceeds LVGL v9 limit")?;
+    let height =
+        u16::try_from(source.height()).map_err(|_| "source height exceeds LVGL v9 limit")?;
+    let stride = width
+        .checked_mul(4)
+        .ok_or("source stride exceeds LVGL v9 limit")?;
+    let expected_info = lvgl::ImageInfo {
+        format: lvgl::ImageFormatKind::Lvgl9Argb8888,
+        width,
+        height,
+        stride,
+    };
+    let mut expected_header = vec![0x19, 0x10, 0, 0];
+    expected_header.extend_from_slice(&width.to_le_bytes());
+    expected_header.extend_from_slice(&height.to_le_bytes());
+    expected_header.extend_from_slice(&stride.to_le_bytes());
+    expected_header.extend_from_slice(&[0, 0]);
+    let (info, actual) = decode_bounded(built)?;
+    let same_metadata = info == expected_info;
+    let same_header = built.get(..12) == Some(expected_header.as_slice());
+    let exact_size = built.len() == 12 + usize::from(stride) * usize::from(height);
+    if !same_metadata || !same_header || !exact_size {
+        return Err("built icon differs from source-dimension LVGL v9 ARGB8888 layout".into());
+    }
+    let same_pixels = actual == source;
+    if !same_pixels || summary.lossy {
+        return Err("built icon pixels differ from unresized RGBA source".into());
+    }
+    Ok(
+        json!({"status":"verified", "contract":"sourceDimensionsArgb8888",
+        "sameMetadata":same_metadata, "sameHeader":same_header, "samePixels":same_pixels, "lossy":false}),
+    )
 }
 
 fn verify_image(
@@ -466,4 +509,53 @@ fn verify_image(
     }
     Ok(json!({"status":"verified", "sameMetadata":same_metadata,
         "sameHeader":same_header, "samePixels":same_pixels, "lossy":summary.lossy}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_free_verification_rejects_changed_header_or_rgba_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = RgbaImage::from_pixel(3, 2, image::Rgba([11, 22, 33, 44]));
+        let input = dir.path().join("source.png");
+        let png = png(&source).unwrap_or_else(|_| panic!("fixture PNG encoding failed"));
+        std::fs::write(&input, &png).unwrap();
+        let summary = project::ResourceSummary {
+            role: "quickapp:org.own".into(),
+            resource: conora_core::app_icons::source("org.own"),
+            input,
+            mode: project::AssetMode::Png,
+            size_bytes: 36,
+            format: Some("LVGL v9 ARGB8888".into()),
+            width: Some(3),
+            height: Some(2),
+            lossy: false,
+            filter: lvgl::ResizeFilter::Nearest,
+        };
+        let encoded = lvgl::encode_png_argb8888(&png).unwrap().bytes;
+        let proof = verify_template_free_icon(&summary, &encoded).unwrap();
+        assert_eq!(proof["samePixels"], true);
+        let mut changed = encoded.clone();
+        changed[10] = 1;
+        assert!(verify_template_free_icon(&summary, &changed).is_err());
+        let mut changed = encoded.clone();
+        changed[12] ^= 1;
+        assert!(
+            verify_template_free_icon(&summary, &changed)
+                .unwrap_err()
+                .contains("pixels")
+        );
+        let mut changed = encoded.clone();
+        changed[15] ^= 1;
+        assert!(
+            verify_template_free_icon(&summary, &changed)
+                .unwrap_err()
+                .contains("pixels")
+        );
+        let mut changed = encoded;
+        changed.push(0);
+        assert!(verify_template_free_icon(&summary, &changed).is_err());
+    }
 }
