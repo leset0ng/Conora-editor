@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use conora_core::{crpack, lvgl, project};
+use corona_core::{crpack, lvgl, project};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
@@ -16,7 +16,7 @@ mod preview;
 
 #[derive(Parser)]
 #[command(
-    name = "conora",
+    name = "corona",
     version,
     about = "Build icon themes for watch firmware"
 )]
@@ -63,9 +63,9 @@ enum Command {
 #[derive(Args)]
 struct Init {
     dir: PathBuf,
-    #[arg(long, default_value = "conora")]
+    #[arg(long, default_value = "corona")]
     theme_id: String,
-    #[arg(long, default_value = "Conora Theme")]
+    #[arg(long, default_value = "Corona Theme")]
     name: String,
     #[arg(long)]
     firmware: Option<PathBuf>,
@@ -1080,21 +1080,21 @@ mod tests {
 
     #[test]
     fn command_selector_groups_are_exclusive_and_required() {
-        assert!(Cli::try_parse_from(["conora", "check"]).is_err());
-        assert!(Cli::try_parse_from(["conora", "check", "--theme", "."]).is_err());
+        assert!(Cli::try_parse_from(["corona", "check"]).is_err());
+        assert!(Cli::try_parse_from(["corona", "check", "--theme", "."]).is_err());
         assert!(
-            Cli::try_parse_from(["conora", "build", "--target", "A", "--all-targets"]).is_err()
+            Cli::try_parse_from(["corona", "build", "--target", "A", "--all-targets"]).is_err()
         );
-        assert!(Cli::try_parse_from(["conora", "check", "--target", "A"]).is_ok());
+        assert!(Cli::try_parse_from(["corona", "check", "--target", "A"]).is_ok());
         assert!(
-            Cli::try_parse_from(["conora", "ls", "--theme", ".", "--target", "A", "--json"])
+            Cli::try_parse_from(["corona", "ls", "--theme", ".", "--target", "A", "--json"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["conora", "ls", "--theme", "."]).is_err());
-        assert!(Cli::try_parse_from(["conora", "ls", "--target", "A"]).is_err());
+        assert!(Cli::try_parse_from(["corona", "ls", "--theme", "."]).is_err());
+        assert!(Cli::try_parse_from(["corona", "ls", "--target", "A"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "conora",
+                "corona",
                 "ls",
                 "--firmware",
                 "f.bin",
@@ -1109,9 +1109,9 @@ mod tests {
 
     #[test]
     fn init_has_no_firmware_requirement_unless_target_or_device_is_explicit() {
-        assert!(Cli::try_parse_from(["conora", "init", "new-theme"]).is_ok());
-        assert!(Cli::try_parse_from(["conora", "init", "new-theme", "--target", "A"]).is_err());
-        assert!(Cli::try_parse_from(["conora", "init", "new-theme", "--device", "watch"]).is_err());
+        assert!(Cli::try_parse_from(["corona", "init", "new-theme"]).is_ok());
+        assert!(Cli::try_parse_from(["corona", "init", "new-theme", "--target", "A"]).is_err());
+        assert!(Cli::try_parse_from(["corona", "init", "new-theme", "--device", "watch"]).is_err());
     }
 
     #[test]
@@ -1146,8 +1146,8 @@ mod tests {
         let root = dir.path().join("theme");
         let args = Init {
             dir: root.clone(),
-            theme_id: "conora".into(),
-            name: "Conora Theme".into(),
+            theme_id: "corona".into(),
+            name: "Corona Theme".into(),
             firmware: None,
             target: "default".into(),
             device: None,
@@ -1168,7 +1168,7 @@ mod tests {
         let root = dir.path().join("theme");
         init(Init {
             dir: root.clone(),
-            theme_id: "conora".into(),
+            theme_id: "corona".into(),
             name: "Theme".into(),
             firmware: None,
             target: "default".into(),
@@ -1232,7 +1232,7 @@ mod tests {
         let root = dir.path().join(OsString::from_vec(b"theme-\xff".to_vec()));
         let error = init(Init {
             dir: root.clone(),
-            theme_id: "conora".into(),
+            theme_id: "corona".into(),
             name: "Theme".into(),
             firmware: None,
             target: "default".into(),

@@ -180,11 +180,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
-name = "conora"
+name = "corona"
 version = "0.2.2"
 dependencies = [
  "clap",
- "conora-core",
+ "corona-core",
  "image",
  "libc",
  "serde_json",
@@ -193,7 +193,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "conora-core"
+name = "corona-core"
 version = "0.2.2"
 dependencies = [
  "image",
@@ -206,12 +206,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "conora-crpack-builder"
+name = "corona-crpack-builder"
 version = "0.1.1"
 dependencies = [
  "astrobox-ng-wit",
  "base64",
- "conora-core",
+ "corona-core",
  "serde_json",
  "tracing",
  "tracing-subscriber",

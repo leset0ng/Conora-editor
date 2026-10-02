@@ -8,11 +8,11 @@ web and native CLI
 
 ## Stack
 
-Shared Rust `conora-core`, a native `conora` CLI, and an AstroBox NG API Level 4 Rust plugin using `wasm32-wasip2`, AstroBox UI v3 and host dialogs.
+Shared Rust `corona-core`, a native `corona` CLI, and an AstroBox NG API Level 4 Rust plugin using `wasm32-wasip2`, AstroBox UI v3 and host dialogs.
 
 ## Users
 
-AstroBox users and coding agents who create or customize Canopus/Conora resource packs for watch firmware, including Xiaomi Band 11.
+AstroBox users and coding agents who create or customize Canopus/Corona resource packs for watch firmware, including Xiaomi Band 11.
 
 ## Product Purpose
 
@@ -36,7 +36,7 @@ The user selects a local OTA firmware archive, browses its resource tree, select
 - The input OTA is a ZIP/JAR containing `vela_resource.bin`, which contains a ROMFS resource tree.
 - Automatic image preview and bidirectional PNG conversion support LVGL v9 (I8, A8, ARGB8888, I4, A4; uncompressed and RLE-compressed), LVGL v8 (RGB565, I8), PNG, and JPEG; PNG inputs with the same aspect ratio are automatically scaled to the source template dimensions using nearest-neighbor sampling; mismatched aspect ratios are rejected without padding, cropping, or stretching. Same-size inputs are not resampled. PNG inputs are limited to 64 MiB and 16 * 1024 * 1024 pixels. Lossy quantization must be explicit.
 - Non-image replacements are copied as file bytes; their device-specific format is not inferred or certified.
-- Export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md` CRPack v1: root `canora.json`, only replacement assets, safe paths, no `mappings.tsv`, and documented size/rule limits. CRPack import/export has no file-count cap; transfers above 128 files need an updated Manager and remain subject to the protocol's 65,536-file index range.
+- Export follows `../Canopus-Module-Resource-Hook/docs/interconnect_proto.md` CRPack v1: root `corona.json`, only replacement assets, safe paths, no `mappings.tsv`, and documented size/rule limits. Import accepts the legacy `canora.json` with identical validation; both names in one pack are rejected. Re-export and extracted file lists use `corona.json`. CRPack import/export has no file-count cap; transfers above 128 files need an updated Manager and remain subject to the protocol's 65,536-file index range.
 - Third-party application icons are authored outside the ROMFS tree. Canopus uses the exact `/data/canopus/manager_icon.bin` mapping and a known LVGL v9 117x117 layout preset; QuickApps use optional package-based `quickappIcons` declarations with actual BIN destinations. Template-free QuickApp PNG conversion retains source dimensions and alpha losslessly as uncompressed LVGL v9 ARGB8888 (native BGRA pixels); an optional supported original BIN template retains existing proportional-resize/layout behavior. Canopus PNGs retain the known preset unless an explicit template is supplied; raw icons must be supported LVGL BIN images. CLI assets/templates are project-owned and can have target overrides; the plugin can export application-only packs without firmware. Import/re-export preserves application declarations and normalized `@quickapp-icon/<package>` keys. QuickApp identifiers are opaque exact strings, not package grammar or paths: no trimming; only a 255-byte UTF-8 prefixed-source budget and exclusion of TSV bytes 0–31/127. New archive filenames use SHA-256 of the package UTF-8 bytes, independent of the identifier syntax.
 - Firmware mappings and QuickApp declarations share the 256-rule/32 KiB TSV budgets. Package syntax, duplicate normalized sources, actual `.bin` files, and safe installed paths are checked. QuickApp application requires an updated Manager/module and approved exact device target (currently Band 11 `.139/.155`); encoding does not verify application installation or Launcher refresh.
 - `.crpack` export is separate from AstroBox `.abp` plugin packaging and does not install or transmit resources to the watch.

@@ -3,14 +3,14 @@ use std::io::Cursor;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use conora_core::crpack::parse_crpack;
-use conora_core::lvgl;
+use corona_core::crpack::parse_crpack;
+use corona_core::lvgl;
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn run(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_conora"))
+    Command::new(env!("CARGO_BIN_EXE_corona"))
         .current_dir(root)
         .args(arguments)
         .output()
@@ -543,7 +543,7 @@ fn non_utf8_output_paths_fail_before_mutation_with_a_json_error() {
     let path = root
         .path()
         .join(std::ffi::OsString::from_vec(b"nonutf8-\xff".to_vec()));
-    let output = Command::new(env!("CARGO_BIN_EXE_conora"))
+    let output = Command::new(env!("CARGO_BIN_EXE_corona"))
         .arg("init")
         .arg(&path)
         .arg("--json")

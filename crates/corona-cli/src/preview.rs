@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use clap::Args;
-use conora_core::{crpack, lvgl, project};
+use corona_core::{crpack, lvgl, project};
 use image::{DynamicImage, ImageReader, Limits, RgbaImage, imageops};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -399,8 +399,8 @@ fn verify_replacements(
                     &theme.root.join(template),
                     project::MAX_TEMPLATE_BYTES,
                 )?)
-            } else if path == conora_core::app_icons::CANOPUS_SOURCE {
-                Some(conora_core::app_icons::canopus_template())
+            } else if path == corona_core::app_icons::CANOPUS_SOURCE {
+                Some(corona_core::app_icons::canopus_template())
             } else {
                 None
             };
@@ -524,7 +524,7 @@ mod tests {
         std::fs::write(&input, &png).unwrap();
         let summary = project::ResourceSummary {
             role: "quickapp:org.own".into(),
-            resource: conora_core::app_icons::source("org.own"),
+            resource: corona_core::app_icons::source("org.own"),
             input,
             mode: project::AssetMode::Png,
             size_bytes: 36,

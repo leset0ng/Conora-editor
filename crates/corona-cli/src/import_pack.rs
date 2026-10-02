@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use conora_core::{app_icons, crpack, lvgl, project};
+use corona_core::{app_icons, crpack, lvgl, project};
 use serde_json::{Value, json};
 
 use super::{Failure, Result, absolute, io_failure, json_bytes, path_text, portable_relative};
@@ -258,7 +258,7 @@ pub(super) fn run(args: Import) -> Result<Value> {
         if rule.source != format!("/resource/{}", rule.destination) {
             diagnostics.push(json!({
                 "code": "mapping_normalized",
-                "message": "Builds use firmware resource paths instead of the original archive rename; the original ordered rule is preserved in source/canora.json.",
+                "message": "Builds use firmware resource paths instead of the original archive rename; the original ordered rule is preserved in source/corona.json.",
                 "source": rule.source, "destination": rule.destination
             }));
         }
@@ -356,12 +356,12 @@ pub(super) fn run(args: Import) -> Result<Value> {
     fs::create_dir_all(parent)
         .map_err(|error| io_failure("could not create import parent", parent, error))?;
     let stage = tempfile::Builder::new()
-        .prefix(".conora-import-")
+        .prefix(".corona-import-")
         .tempdir_in(parent)
         .map_err(|error| io_failure("could not stage import", parent, error))?;
     let stage_root = stage.path();
     write_file(stage_root, "source/original.crpack", &pack_bytes)?;
-    write_file(stage_root, "source/canora.json", &pack.manifest_bytes)?;
+    write_file(stage_root, "source/corona.json", &pack.manifest_bytes)?;
     let mut icons = BTreeMap::new();
     let mut quickapp_icons = BTreeMap::new();
     let mut canopus_icon = None;

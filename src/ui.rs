@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::crpack::{self, Mapping, PackOptions, QuickappIcon};
 use crate::firmware::{BrowserEntry, FirmwareIndex};
 use crate::lvgl;
-use conora_core::app_icons;
+use corona_core::app_icons;
 
 const MAX_VISIBLE_ENTRIES: usize = 300;
 const MAX_SEARCH_RESULTS: usize = 200;
@@ -107,8 +107,8 @@ impl Default for UiState {
             canopus: None,
             quickapps: Vec::new(),
             quickapp_package: String::new(),
-            theme_id: "conora".into(),
-            pack_name: "Conora Resource Pack".into(),
+            theme_id: "corona".into(),
+            pack_name: "Corona Resource Pack".into(),
             version: "1.0.0".into(),
             author: String::new(),
             description: String::new(),
@@ -2026,7 +2026,7 @@ fn safe_file_stem(value: &str) -> String {
         .map(char::from)
         .collect::<String>();
     if value.is_empty() {
-        "conora".into()
+        "corona".into()
     } else {
         value
     }
@@ -3020,12 +3020,12 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
         .grid_template_columns("repeat(auto-fit, minmax(min(100%, 180px), 1fr))")
         .gap(8)
         .width_full()
-        .child(field("包标识", &state.theme_id, "pack.id", "conora"))
+        .child(field("包标识", &state.theme_id, "pack.id", "corona"))
         .child(field(
             "包名称",
             &state.pack_name,
             "pack.name",
-            "Conora Resource Pack",
+            "Corona Resource Pack",
         ))
         .child(field("版本", &state.version, "pack.version", "1.0.0"))
         .child(field("作者（可选）", &state.author, "pack.author", ""))
@@ -3286,7 +3286,7 @@ mod tests {
         };
         let package = crpack::build_crpack_with_icons(
             &PackOptions {
-                theme_id: "conora",
+                theme_id: "corona",
                 name: "Custom",
                 version: None,
                 author: None,
@@ -3414,7 +3414,7 @@ mod tests {
         )]);
         let package = crpack::build_crpack_with_icons(
             &PackOptions {
-                theme_id: "conora",
+                theme_id: "corona",
                 name: "Icons",
                 version: None,
                 author: None,

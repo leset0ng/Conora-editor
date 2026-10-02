@@ -1,6 +1,6 @@
-# Conora Core
+# Corona Core
 
-Shared Rust implementation for the AstroBox Conora editor and the native `conora` CLI.
+Shared Rust implementation for the AstroBox Corona editor and the native `corona` CLI.
 
 - Inspect OTA ZIP/JAR archives containing `vela_resource.bin`, or raw ROMFS images.
 - Inspect and convert supported LVGL, PNG and JPEG images using firmware originals as templates.
@@ -10,7 +10,7 @@ Shared Rust implementation for the AstroBox Conora editor and the native `conora
 
 ```rust,no_run
 use std::path::Path;
-use conora_core::project::{load_theme, prepare_target};
+use corona_core::project::{load_theme, prepare_target};
 
 let theme = load_theme(Path::new("my-icons"))?;
 let prepared = prepare_target(&theme, "band11-A");

@@ -2,12 +2,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use conora_core::{app_icons, crpack};
+use corona_core::{app_icons, crpack};
 use image::{Rgba, RgbaImage};
 use serde_json::{Value, json};
 
 fn run(root: &Path, args: &[&str], code: i32) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_conora"))
+    let output = Command::new(env!("CARGO_BIN_EXE_corona"))
         .current_dir(root)
         .args(args)
         .arg("--json")
@@ -122,7 +122,7 @@ fn png_and_raw_native_icons_check_preview_build_and_remove() {
     assert_eq!(index["resources"].as_array().unwrap().len(), 2);
     run(root, &["build", "--theme", "theme", "--target", "A"], 0);
     let built =
-        crpack::parse_crpack(&fs::read(root.join("theme/dist/conora-A.crpack")).unwrap()).unwrap();
+        crpack::parse_crpack(&fs::read(root.join("theme/dist/corona-A.crpack")).unwrap()).unwrap();
     assert!(
         built
             .replacements
@@ -256,7 +256,7 @@ fn invalid_selectors_templates_inputs_and_packages_do_not_mutate_config() {
     }
     let large = fs::File::create(root.join("oversized.bin")).unwrap();
     large
-        .set_len(conora_core::project::MAX_TEMPLATE_BYTES as u64 + 1)
+        .set_len(corona_core::project::MAX_TEMPLATE_BYTES as u64 + 1)
         .unwrap();
     run(
         root,
@@ -360,7 +360,7 @@ fn non_utf8_inputs_and_symlink_theme_files_fail_without_asset_publication() {
     let root = dir.path();
     let before = fs::read(root.join("theme/theme.json")).unwrap();
     let path = std::ffi::OsString::from_vec(b"icon-\xff.png".to_vec());
-    let output = Command::new(env!("CARGO_BIN_EXE_conora"))
+    let output = Command::new(env!("CARGO_BIN_EXE_corona"))
         .current_dir(root)
         .args(["icon", "set", "--canopus"])
         .arg(path)
@@ -545,7 +545,7 @@ fn opaque_quickapp_ids_set_list_check_preview_build_and_remove_exactly() {
     run(root, &["check", "--theme", "theme", "--target", "A"], 0);
     run(root, &["build", "--theme", "theme", "--target", "A"], 0);
     let built =
-        crpack::parse_crpack(&fs::read(root.join("theme/dist/conora-A.crpack")).unwrap()).unwrap();
+        crpack::parse_crpack(&fs::read(root.join("theme/dist/corona-A.crpack")).unwrap()).unwrap();
     assert_eq!(built.quickapp_icons.len(), packages.len());
     for package in &packages {
         let destination = app_icons::destination(package);
@@ -646,7 +646,7 @@ fn custom_resize_filter_records_in_theme_json() {
 
 #[test]
 fn template_free_quickapp_png_set_check_preview_verify_build_preserves_rgba() {
-    use conora_core::lvgl;
+    use corona_core::lvgl;
     let dir = fixture();
     let root = dir.path();
     let image = RgbaImage::from_fn(301, 2, |x, y| {
@@ -698,7 +698,7 @@ fn template_free_quickapp_png_set_check_preview_verify_build_preserves_rgba() {
     );
     run(root, &["build", "--theme", "theme", "--target", "A"], 0);
     let pack =
-        crpack::parse_crpack(&fs::read(root.join("theme/dist/conora-A.crpack")).unwrap()).unwrap();
+        crpack::parse_crpack(&fs::read(root.join("theme/dist/corona-A.crpack")).unwrap()).unwrap();
     let encoded = &pack.replacements[&app_icons::destination("org.own")];
     let (info, actual) = lvgl::decode_to_rgba(encoded).unwrap();
     assert_eq!(info.format, lvgl::ImageFormatKind::Lvgl9Argb8888);
@@ -747,7 +747,7 @@ fn template_free_quickapp_png_size_and_decode_failures_do_not_publish() {
     }
     fs::File::create(root.join("oversized.png"))
         .unwrap()
-        .set_len(conora_core::project::MAX_TEMPLATE_BYTES as u64 + 1)
+        .set_len(corona_core::project::MAX_TEMPLATE_BYTES as u64 + 1)
         .unwrap();
     run(
         root,

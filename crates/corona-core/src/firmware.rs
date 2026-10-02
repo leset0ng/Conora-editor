@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn parses_real_firmware_when_requested() {
-        let Some(path) = std::env::var_os("CONORA_TEST_FIRMWARE") else {
+        let Some(path) = std::env::var_os("CORONA_TEST_FIRMWARE") else {
             return;
         };
         let firmware = std::fs::read(path).expect("read requested firmware test fixture");
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn parses_large_firmware_when_requested() {
-        let Some(path) = std::env::var_os("CONORA_TEST_LARGE_FIRMWARE") else {
+        let Some(path) = std::env::var_os("CORONA_TEST_LARGE_FIRMWARE") else {
             return;
         };
         let firmware = std::fs::read(path).expect("read requested large firmware fixture");

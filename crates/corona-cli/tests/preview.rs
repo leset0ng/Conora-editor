@@ -2,13 +2,13 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use conora_core::{crpack, lvgl};
+use corona_core::{crpack, lvgl};
 use image::{Rgba, RgbaImage};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn run(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_conora"))
+    Command::new(env!("CARGO_BIN_EXE_corona"))
         .current_dir(root)
         .args(args)
         .output()
@@ -167,7 +167,7 @@ fn actual_pack_pixels_dimensions_manifest_and_verification_are_indexed() {
         0,
     );
     let pack =
-        crpack::parse_crpack(&fs::read(root.path().join("theme/dist/conora-A.crpack")).unwrap())
+        crpack::parse_crpack(&fs::read(root.path().join("theme/dist/corona-A.crpack")).unwrap())
             .unwrap();
     let (_, actual) = lvgl::decode_to_rgba(&pack.replacements["app/icons/test00000.bin"]).unwrap();
     assert_eq!(png, actual);

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use clap::Args;
-use conora_core::{firmware::ResourceFile, lvgl, project};
+use corona_core::{firmware::ResourceFile, lvgl, project};
 use serde_json::{Value, json};
 
 use super::{Failure, Result, image_json};

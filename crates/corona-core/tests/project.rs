@@ -2,9 +2,9 @@ use std::fs;
 use std::io::{Cursor, Write};
 use std::path::Path;
 
-use conora_core::crpack::parse_crpack;
-use conora_core::lvgl;
-use conora_core::project::{load_firmware, load_theme, prepare_target, target_ids};
+use corona_core::crpack::parse_crpack;
+use corona_core::lvgl;
+use corona_core::project::{load_firmware, load_theme, prepare_target, target_ids};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -15,7 +15,7 @@ fn firmware_limit_rejects_large_sparse_files_before_reading() {
     let path = directory.path().join("oversized.bin");
     fs::File::create(&path)
         .unwrap()
-        .set_len(conora_core::project::MAX_FIRMWARE_BYTES as u64 + 1)
+        .set_len(corona_core::project::MAX_FIRMWARE_BYTES as u64 + 1)
         .unwrap();
     let error = load_firmware(&path, None).err().unwrap();
     assert!(error.contains("input limit"));
@@ -34,7 +34,7 @@ fn special_file_inputs_are_rejected_without_blocking() {
             .success()
     );
     assert!(
-        conora_core::project::read_limited(&path, 1024)
+        corona_core::project::read_limited(&path, 1024)
             .unwrap_err()
             .contains("regular file")
     );
@@ -59,7 +59,7 @@ fn oversized_compressed_templates_are_rejected_before_materialization() {
     let directory = project();
     let original = template(2, 2, 0x0a);
     let mut header = romfs("icons", &original, 1);
-    let size = conora_core::project::MAX_TEMPLATE_BYTES + 1;
+    let size = corona_core::project::MAX_TEMPLATE_BYTES + 1;
     header[8..12].copy_from_slice(&((128 + size) as u32).to_be_bytes());
     header[104..108].copy_from_slice(&(size as u32).to_be_bytes());
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -123,12 +123,12 @@ fn application_icons_build_without_firmware_bindings_and_support_target_template
     let pack = parse_crpack(&built.pack.unwrap()).unwrap();
     assert_eq!(
         pack.mappings[0].source,
-        conora_core::app_icons::CANOPUS_SOURCE
+        corona_core::app_icons::CANOPUS_SOURCE
     );
     assert_eq!(pack.quickapp_icons[0].package, "ng.lst.corona");
     assert_eq!(
         lvgl::inspect_image(
-            &pack.replacements[&conora_core::app_icons::destination("ng.lst.corona")]
+            &pack.replacements[&corona_core::app_icons::destination("ng.lst.corona")]
         )
         .unwrap()
         .width,
@@ -542,7 +542,7 @@ fn explicit_exclusions_are_reported_without_reading_their_assets() {
             .iter()
             .any(|error| error.code == "missing_binding")
     );
-    let loaded = conora_core::project::load_target(&theme, "A").unwrap();
+    let loaded = corona_core::project::load_target(&theme, "A").unwrap();
     assert!(loaded.excluded.is_empty());
     assert!(
         serde_json::to_value(loaded)
@@ -601,7 +601,7 @@ fn invalid_exclusions_and_conflicts_are_independent_errors() {
 
 #[test]
 fn dotted_firmware_version_target_ids_are_safe_and_discoverable() {
-    use conora_core::project::validate_target_id;
+    use corona_core::project::validate_target_id;
     for id in ["p67-3.101.043", "A.B", "a."] {
         assert!(validate_target_id(id).is_ok());
     }
@@ -633,8 +633,8 @@ fn dotted_firmware_version_target_ids_are_safe_and_discoverable() {
     assert!(prepare_target(&theme, "p67-3.101.043").report.valid);
 }
 
-fn batch_indexes() -> Vec<conora_core::firmware::FirmwareIndex> {
-    use conora_core::firmware::FirmwareIndex;
+fn batch_indexes() -> Vec<corona_core::firmware::FirmwareIndex> {
+    use corona_core::firmware::FirmwareIndex;
     let data = romfs("icons", b"test", 2);
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     writer
@@ -746,7 +746,7 @@ fn preparation_progress_reports_loading_and_conversion_without_rereading_assets(
     write_json(&path, &config);
     let theme = load_theme(directory.path()).unwrap();
     let mut events = Vec::new();
-    let built = conora_core::project::prepare_target_with_progress(&theme, "A", |event| {
+    let built = corona_core::project::prepare_target_with_progress(&theme, "A", |event| {
         events.push(event.to_owned());
         if event == "Converting role confirm" {
             fs::remove_file(directory.path().join("assets/icon.png")).unwrap();
@@ -768,7 +768,7 @@ fn preparation_progress_reports_loading_and_conversion_without_rereading_assets(
 fn aggregate_template_limit_rejects_conversion_before_materializing_any_template() {
     let directory = project();
     let mut original = template(2, 2, 0x0a);
-    original.resize(conora_core::project::MAX_TEMPLATE_BYTES / 2 + 1, 0);
+    original.resize(corona_core::project::MAX_TEMPLATE_BYTES / 2 + 1, 0);
     let data = romfs("icons", &original, 2);
     drop(original);
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -792,7 +792,7 @@ fn aggregate_template_limit_rejects_conversion_before_materializing_any_template
         }),
     );
     let mut conversion_started = false;
-    let built = conora_core::project::prepare_target_with_progress(
+    let built = corona_core::project::prepare_target_with_progress(
         &load_theme(directory.path()).unwrap(),
         "aggregate",
         |event| {
@@ -818,7 +818,7 @@ fn aggregate_source_assets_are_bounded_even_when_each_file_is_within_its_limit()
     for name in ["first.bin", "second.bin"] {
         fs::File::create(directory.path().join("assets").join(name))
             .unwrap()
-            .set_len((conora_core::project::MAX_TEMPLATE_BYTES / 2 + 1) as u64)
+            .set_len((corona_core::project::MAX_TEMPLATE_BYTES / 2 + 1) as u64)
             .unwrap();
     }
     write_json(
@@ -890,7 +890,7 @@ fn template_free_quickapp_project_build_retains_source_dimensions_and_alpha() {
     let pack = parse_crpack(&built.pack.unwrap()).unwrap();
     assert!(pack.mappings.is_empty());
     for package in ["org.app", "org.shared"] {
-        let bytes = &pack.replacements[&conora_core::app_icons::destination(package)];
+        let bytes = &pack.replacements[&corona_core::app_icons::destination(package)];
         assert_eq!(lvgl::decode_to_rgba(bytes).unwrap().1, image);
     }
 }

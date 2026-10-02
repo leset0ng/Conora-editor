@@ -1,4 +1,4 @@
-# Conora CLI
+# Corona CLI
 
 A non-interactive, local CLI for creating CRPack v1 resource packs. A theme supplies reusable icon source images; each firmware target supplies real resource paths and its own original encoding templates. No AI provider, AstroBox host or device connection is required.
 
@@ -7,17 +7,17 @@ A non-interactive, local CLI for creating CRPack v1 resource packs. A theme supp
 From this repository:
 
 ```bash
-cargo install --path crates/conora-cli --locked
-conora --help
+cargo install --path crates/corona-cli --locked
+corona --help
 ```
 
-After `conora-core` and `conora` are published to crates.io:
+After `corona-core` and `corona` are published to crates.io:
 
 ```bash
-cargo install conora --locked
+cargo install corona --locked
 ```
 
-The installed executable is `conora`. These crates are prepared for publication but are not published by this change. Rust 1.88 or newer is required. The existing AstroBox plugin remains a separate WASM build.
+The installed executable is `corona`. These crates are prepared for publication but are not published by this change. Rust 1.88 or newer is required. The existing AstroBox plugin remains a separate WASM build.
 
 ## One theme, multiple firmwares
 
@@ -36,10 +36,10 @@ my-icons/
 Initialize a theme and pin two firmware inputs:
 
 ```bash
-conora init my-icons --theme-id dark --name "Dark Icons" \
+corona init my-icons --theme-id dark --name "Dark Icons" \
   --firmware /path/to/firmware-A.bin --target band11-A \
   --device xiaomi-band-11-4.100.155
-conora target add band11-B --theme my-icons \
+corona target add band11-B --theme my-icons \
   --firmware /path/to/firmware-B.bin --device another-firmware
 ```
 
@@ -48,9 +48,9 @@ conora target add band11-B --theme my-icons \
 Inspect each firmware and extract original reference images:
 
 ```bash
-conora ls --theme my-icons --target band11-A --images --json
-conora ls --theme my-icons --target band11-B --images --search confirm --json
-conora extract --theme my-icons --target band11-A \
+corona ls --theme my-icons --target band11-A --images --json
+corona ls --theme my-icons --target band11-B --images --search confirm --json
+corona extract --theme my-icons --target band11-A \
   --resource app/common/icon/confirm.bin --as png \
   --output my-icons/previews/confirm.png
 ```
@@ -60,7 +60,7 @@ You can inspect/extract a firmware without a theme using `--firmware /path/to/fi
 Repeat `--resource` for batch extraction. One resource retains the original output-file behavior; multiple resources interpret `--output` as a directory and preserve resource subdirectories (PNG filenames replace the original extension):
 
 ```bash
-conora extract --theme my-icons --target band11-A \
+corona extract --theme my-icons --target band11-A \
   --resource app/first/launcher.bin --resource app/second/launcher.bin \
   --as png --output ./references --json
 ```
@@ -166,13 +166,13 @@ For arbitrary binary replacement, use `{"input": "assets/file.bin", "mode": "raw
 These are **filesystem icons, not firmware `/resource/` bindings**. Configure them independently of shared firmware roles:
 
 ```bash
-conora icon set --canopus ./canopus.png --theme my-icons
-conora icon set --package org.example.app ./app.png \
+corona icon set --canopus ./canopus.png --theme my-icons
+corona icon set --package org.example.app ./app.png \
   --template ./original.bin --theme my-icons
-conora icon set --package org.example.app ./replacement.bin --raw --theme my-icons
-conora icon ls --theme my-icons --json
-conora icon remove --canopus --theme my-icons
-conora icon remove --package org.example.app --theme my-icons
+corona icon set --package org.example.app ./replacement.bin --raw --theme my-icons
+corona icon ls --theme my-icons --json
+corona icon remove --canopus --theme my-icons
+corona icon remove --package org.example.app --theme my-icons
 ```
 
 Choose exactly one of `--canopus` or `--package PACKAGE` for set/remove. A QuickApp package is an opaque, exact identifier, not a device path. Empty strings, single names, Unicode, spaces, slashes (including a trailing slash), colons, backslashes, and dot patterns are accepted unchanged. No trimming or Unicode normalization is applied; identifiers are case-sensitive. Only wire safety is enforced: `@quickapp-icon/` plus the package must be at most 255 UTF-8 bytes (240 bytes for the package), and bytes 0–31 and 127 are forbidden. Non-ASCII Unicode control characters are not rejected by this byte-level rule. Quote shell arguments to preserve spaces, and use `--package ""` for an empty identifier. The CLI never guesses a QuickApp installation path.
@@ -207,12 +207,13 @@ Reads are bounded (64 MiB per input/template, 1 MiB config). Theme updates are s
 ## Import an existing pack
 
 ```bash
-conora import recircle.crpack --into ./recircle \
+corona import recircle.crpack --into ./recircle \
   --firmware /path/to/p67.bin --target p67-3.101.043 --json
 ```
 
 - The destination must be new. Import stages and validates a complete project before atomically publishing it without replacing an existing directory, including racing empty directories or symlinks. Supported publication platforms are macOS/iOS, Linux/Android and Windows; unsupported no-replace filesystems/platforms fail safely.
-- Metadata and the original archive/manifest are preserved in `source/original.crpack` and `source/canora.json`; original resource bytes are in `source/raw/`. `source/import.json` records mappings, diagnostics and unbound files.
+- Import accepts exactly one root `corona.json` or legacy `canora.json`, with identical size, CRC and format checks. Both names in one archive are rejected, even if their contents match. New builds and extracted file lists always use `corona.json`.
+- Metadata and the original archive/manifest bytes are preserved in `source/original.crpack` and `source/corona.json`; the backup archive remains byte-for-byte unchanged, even when its manifest uses the legacy filename. Original resource bytes are in `source/raw/`. `source/import.json` records mappings, diagnostics and unbound files.
 - Bindings are resolved from the actual ordered source/destination mappings, including archive renames; filenames alone are not evidence. Missing firmware resources, ambiguous/order-dependent rules and arbitrary mappings outside `/resource/` fail rather than being guessed. The exact Canopus source and declared/normalized QuickApp icon sources are recognized separately and imported as validated, byte-preserving raw native assets; native-only packs are supported. These icons are not turned into firmware roles or silently dropped. Multiple native consumers may share one original BIN and remain independent declarations. An overlapping ordinary firmware mapping is explicitly rejected rather than discarded. Original archive destinations are normalized on rebuild.
 - Supported images become shared editable PNGs. Unsupported or malformed images remain explicit raw assets, with diagnostics. Unmapped archive files are preserved but not included in builds, and this limitation is reported.
 - **The imported target has raw overrides for decoded PNG roles, preserving the original mapped resource bytes.** To use edited PNG artwork for that target, remove the corresponding override. New targets added afterward have no overrides and use shared PNG conversion. Raw-original warnings are deliberate: byte preservation is not device-format certification.
@@ -221,9 +222,9 @@ conora import recircle.crpack --into ./recircle \
 ## Read-only adaptation planning
 
 ```bash
-conora target add q66-4.100.155 --theme ./recircle --firmware /path/to/q66.bin
-conora plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 --json
-conora plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 \
+corona target add q66-4.100.155 --theme ./recircle --firmware /path/to/q66.bin
+corona plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 --json
+corona plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 \
   --compare-images --json
 ```
 
@@ -234,8 +235,8 @@ Optional `artworkSimilarity` compares normalized, alpha-premultiplied pixels onl
 ## Preview and verify actual encoded resources
 
 ```bash
-conora preview --theme ./recircle --target q66-4.100.155 --verify --json
-conora preview --theme ./recircle --all-targets --output ./previews --force --json
+corona preview --theme ./recircle --target q66-4.100.155 --verify --json
+corona preview --theme ./recircle --all-targets --output ./previews --force --json
 ```
 
 Preview prepares current target packs in memory, then decodes **the actual encoded replacements**, not the source images. It does not publish `.crpack` files or inspect a stale existing `dist/` file. Individual PNGs are at most 2048 pixels per side; paginated contact sheets use 112-pixel tiles, eight columns and at most 256 tiles per page. `preview_index-<target>.json` maps each tile/PNG ID to its role, resource, dimensions and original manifest. No font dependency is needed for raster labels: the adjacent JSON index is authoritative.
@@ -247,11 +248,11 @@ Inputs/decoded images are bounded, output filenames are collision-checked, and i
 ## Check and build
 
 ```bash
-conora check --theme my-icons --target band11-A --json
-conora check --theme my-icons --all-targets --json
-conora build --theme my-icons --all-targets
-conora build --theme my-icons --target band11-A --output ./packs --force
-conora inspect ./packs/dark-band11-A.crpack --json
+corona check --theme my-icons --target band11-A --json
+corona check --theme my-icons --all-targets --json
+corona build --theme my-icons --all-targets
+corona build --theme my-icons --target band11-A --output ./packs --force
+corona inspect ./packs/dark-band11-A.crpack --json
 ```
 
 - Choose exactly one of `--target ID` or `--all-targets`.
@@ -288,6 +289,6 @@ Exit codes:
 
 Native CLI firmware inputs are limited to 512 MiB; config files to 1 MiB; source assets, original conversion templates and extracted resources to 64 MiB each. Project preparation additionally limits aggregate retained source assets and selected conversion templates to 64 MiB per target, and batch extraction applies aggregate 64 MiB budgets to both inputs and outputs. Single-resource browser reads remain lazy; native multi-resource preparation uses a bounded forward-only scan instead of restarting deflate for each icon. PNG decoding is additionally limited to 16 * 1024 * 1024 pixels. Inputs must be regular files; Unix FIFOs are rejected without blocking. Native CLI paths used in configs/results must be representable in UTF-8.
 
-CRPack output follows v1: one root `canora.json`, safe resource paths, at most 256 mappings, at most 64 KiB manifest, at most 32 KiB generated mapping configuration and at most 64 MiB total uncompressed content including the manifest. The container has no file-count cap; Interconnect transfers still have a 65,536-file index limit, and older Managers can impose further limits. `mappings.tsv` is derived on-device and must not be included in a pack.
+CRPack output follows v1: one root `corona.json`, safe resource paths, at most 256 mappings, at most 64 KiB manifest, at most 32 KiB generated mapping configuration and at most 64 MiB total uncompressed content including the manifest. The container has no file-count cap; Interconnect transfers still have a 65,536-file index limit, and older Managers can impose further limits. `mappings.tsv` is derived on-device and must not be included in a pack.
 
 The CLI does not modify firmware, install themes, talk to watches, call image generators, or guarantee on-device appearance. A coding agent can produce/edit source PNGs and configs, then run `check` and `build`; use the AstroBox editor or the device to visually review the results.

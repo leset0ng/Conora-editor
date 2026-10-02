@@ -170,7 +170,7 @@ def main():
     if args.build_std:
         cargo_args.extend(["-Z", "build-std=std,panic_abort"])
 
-    cargo_args.extend(["--package", "conora-crpack-builder", "--lib"])
+    cargo_args.extend(["--package", "corona-crpack-builder", "--lib"])
     cargo_args.extend(extra)
 
     root_dir = Path(__file__).resolve().parent.parent

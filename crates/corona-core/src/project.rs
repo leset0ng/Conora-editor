@@ -333,7 +333,7 @@ pub fn target_ids(project: &ThemeProject) -> Result<Vec<String>, String> {
     }
     ids.sort();
     if ids.is_empty() {
-        return Err("no target configs found; use 'conora target add' first".into());
+        return Err("no target configs found; use 'corona target add' first".into());
     }
     Ok(ids)
 }
@@ -356,7 +356,7 @@ pub fn load_target(project: &ThemeProject, id: &str) -> Result<Target, String> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err("firmwareSha256 must be 64 lowercase hexadecimal characters; use 'conora target add' to pin a firmware".into());
+        return Err("firmwareSha256 must be 64 lowercase hexadecimal characters; use 'corona target add' to pin a firmware".into());
     }
     crpack::validate_pack_metadata(
         &project.theme.theme_id,

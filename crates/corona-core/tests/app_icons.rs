@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
-use conora_core::{
+use corona_core::{
     app_icons,
     crpack::{self, Mapping, PackOptions, QuickappIcon},
 };
@@ -22,7 +22,7 @@ fn options(files: &BTreeMap<String, Vec<u8>>) -> PackOptions<'_> {
 fn archive(manifest: Value, files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default();
-    writer.start_file("canora.json", opts).unwrap();
+    writer.start_file("corona.json", opts).unwrap();
     writer
         .write_all(&serde_json::to_vec(&manifest).unwrap())
         .unwrap();
@@ -205,7 +205,7 @@ fn quickapp_rules_share_count_and_tsv_budgets_with_mappings() {
 
 #[test]
 fn raw_icons_require_actual_lvgl_bin_and_pngs_allow_optional_quickapp_templates() {
-    let (_, png) = conora_core::lvgl::decode_image_png(&app_icons::canopus_template()).unwrap();
+    let (_, png) = corona_core::lvgl::decode_image_png(&app_icons::canopus_template()).unwrap();
     assert!(app_icons::encode(&png, None, false, true, false).is_err());
     let quickapp = app_icons::encode(&png, None, false, false, false).unwrap();
     assert_eq!(quickapp, app_icons::canopus_template());
@@ -324,7 +324,7 @@ fn both_quickapp_declarations_and_semantic_mapping_sources_enforce_wire_safety()
 
 #[test]
 fn template_free_quickapp_encoding_ignores_resize_and_quantize_options() {
-    use conora_core::lvgl::{self, ResizeFilter};
+    use corona_core::lvgl::{self, ResizeFilter};
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     let image = RgbaImage::from_fn(257, 1, |x, _| Rgba([x as u8, (x / 256) as u8, 91, x as u8]));
     let mut png = Cursor::new(Vec::new());

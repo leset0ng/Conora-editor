@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
-use conora_core::project;
+use corona_core::project;
 use serde_json::{Value, json};
 
 use super::{Failure, Result};
@@ -49,7 +49,7 @@ pub(super) struct Set {
     allow_quantize: bool,
     /// Image downscale / resize sampling filter (lanczos3 [default], nearest, triangle, catmull-rom, gaussian).
     #[arg(long, conflicts_with = "raw")]
-    filter: Option<conora_core::ResizeFilter>,
+    filter: Option<corona_core::ResizeFilter>,
 }
 
 #[derive(Args)]
@@ -131,13 +131,13 @@ pub(super) fn run(command: IconCommand) -> Result<Value> {
                 .map_err(|e| Failure::new("json", e.to_string()))?;
             let mut entries = Vec::new();
             if value["canopusIcon"].is_object() {
-                entries.push(json!({"kind":"canopus", "source":conora_core::app_icons::CANOPUS_SOURCE,
-                    "destination":conora_core::app_icons::CANOPUS_DESTINATION, "asset":value["canopusIcon"]}));
+                entries.push(json!({"kind":"canopus", "source":corona_core::app_icons::CANOPUS_SOURCE,
+                    "destination":corona_core::app_icons::CANOPUS_DESTINATION, "asset":value["canopusIcon"]}));
             }
             if let Some(icons) = value["quickappIcons"].as_object() {
                 for (package, asset) in icons {
                     entries.push(json!({"kind":"quickapp", "package":package,
-                        "destination":conora_core::app_icons::destination(package), "asset":asset}));
+                        "destination":corona_core::app_icons::destination(package), "asset":asset}));
                 }
             }
             Ok(json!({"theme":super::theme_input(&args.theme, &theme), "icons":entries}))
@@ -165,11 +165,11 @@ fn mutate(
         bool,
         Option<PathBuf>,
         bool,
-        conora_core::ResizeFilter,
+        corona_core::ResizeFilter,
     )>,
 ) -> Result<Value> {
     if let Some(package) = &selector.package {
-        conora_core::app_icons::validate_package(package)?;
+        corona_core::app_icons::validate_package(package)?;
     }
     let theme = project::load_theme(theme_argument)?;
     // Keep the caller's lexical file path: load_theme canonicalizes it, which
@@ -212,7 +212,7 @@ fn mutate(
             .transpose()?;
         // Validate the complete conversion before any project mutation. The core
         // encoder bounds image dimensions and rejects malformed native raw BINs.
-        conora_core::app_icons::encode_with_filter(
+        corona_core::app_icons::encode_with_filter(
             &bytes,
             template.as_deref(),
             selector.canopus,
@@ -373,10 +373,10 @@ pub(super) fn collect_inputs(value: &Value, root: &Path, inputs: &mut Vec<PathBu
 }
 
 pub(super) fn archive_path(identity: &str) -> String {
-    if identity == conora_core::app_icons::CANOPUS_SOURCE {
-        conora_core::app_icons::CANOPUS_DESTINATION.into()
+    if identity == corona_core::app_icons::CANOPUS_SOURCE {
+        corona_core::app_icons::CANOPUS_DESTINATION.into()
     } else if let Some(package) = identity.strip_prefix("@quickapp-icon/") {
-        conora_core::app_icons::destination(package)
+        corona_core::app_icons::destination(package)
     } else {
         identity.into()
     }
@@ -387,7 +387,7 @@ pub(super) fn asset(
     target: &project::Target,
     identity: &str,
 ) -> Result<Option<Value>> {
-    if identity != conora_core::app_icons::CANOPUS_SOURCE
+    if identity != corona_core::app_icons::CANOPUS_SOURCE
         && !identity.starts_with("@quickapp-icon/")
     {
         return Ok(None);
@@ -397,7 +397,7 @@ pub(super) fn asset(
     let overrides =
         serde_json::to_value(target).map_err(|e| Failure::new("json", e.to_string()))?;
     let get = |value: &Value| -> Value {
-        if identity == conora_core::app_icons::CANOPUS_SOURCE {
+        if identity == corona_core::app_icons::CANOPUS_SOURCE {
             value["canopusIcon"].clone()
         } else {
             value["quickappIcons"][identity.strip_prefix("@quickapp-icon/").unwrap()].clone()

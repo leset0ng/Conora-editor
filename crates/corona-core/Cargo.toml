@@ -1,9 +1,9 @@
 [package]
-name = "conora-core"
+name = "corona-core"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
-description = "Firmware resource inspection, image conversion and CRPack building for Conora"
+description = "Firmware resource inspection, image conversion and CRPack building for Corona"
 license = "MIT"
 repository = "https://github.com/leset0ng/Conora-editor"
 readme = "README.md"

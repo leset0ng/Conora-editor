@@ -4,12 +4,12 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::{Command, Output};
 
-use conora_core::{crpack, lvgl};
+use corona_core::{crpack, lvgl};
 use serde_json::{Value, json};
 use zip::write::SimpleFileOptions;
 
 fn run(root: &Path, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_conora"))
+    Command::new(env!("CARGO_BIN_EXE_corona"))
         .current_dir(root)
         .args(arguments)
         .output()
@@ -70,7 +70,7 @@ fn rejected(root: &Path) -> Value {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".conora-import-")
+            .starts_with(".corona-import-")
     }));
     value
 }
@@ -137,9 +137,17 @@ fn manifest(mappings: Value) -> Value {
 }
 
 fn archive(manifest_bytes: &[u8], files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    archive_with_manifest_name("corona.json", manifest_bytes, files)
+}
+
+fn archive_with_manifest_name(
+    name: &str,
+    manifest_bytes: &[u8],
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    writer.start_file("canora.json", options).unwrap();
+    writer.start_file(name, options).unwrap();
     writer.write_all(manifest_bytes).unwrap();
     for (path, bytes) in files {
         writer.start_file(path, options).unwrap();
@@ -189,7 +197,7 @@ fn fictional_two_image_and_all_forty_image_roundtrip_preserve_originals() {
             original
         );
         assert_eq!(
-            fs::read(root.path().join("theme/source/canora.json")).unwrap(),
+            fs::read(root.path().join("theme/source/corona.json")).unwrap(),
             parsed.manifest_bytes
         );
         let theme = read_json(&root.path().join("theme/theme.json"));
@@ -231,6 +239,60 @@ fn fictional_two_image_and_all_forty_image_roundtrip_preserve_originals() {
         assert_eq!(rebuilt.name, parsed.name);
         assert_eq!(rebuilt.author, parsed.author);
     }
+}
+
+#[test]
+fn legacy_manifest_import_saves_and_rebuilds_with_the_canonical_filename() {
+    let files = BTreeMap::from([("app/icons/test.bin".into(), template(2, 0x10))]);
+    let metadata = serde_json::to_vec_pretty(&standard_manifest()).unwrap();
+    let root = fixture(&files, &files, &standard_manifest());
+    let original = archive_with_manifest_name("canora.json", &metadata, &files);
+    fs::write(root.path().join("input.crpack"), &original).unwrap();
+    import(root.path(), "theme");
+    assert_eq!(
+        fs::read(root.path().join("theme/source/corona.json")).unwrap(),
+        metadata
+    );
+    assert!(!root.path().join("theme/source/canora.json").exists());
+    assert_eq!(
+        fs::read(root.path().join("theme/source/original.crpack")).unwrap(),
+        original
+    );
+    let inspected = result(
+        run(root.path(), &["inspect", "input.crpack", "--json"]),
+        true,
+    );
+    assert!(inspected.to_string().contains("corona.json"));
+    assert!(!inspected.to_string().contains("canora.json"));
+    result(
+        run(
+            root.path(),
+            &["build", "--theme", "theme", "--target", "default", "--json"],
+        ),
+        true,
+    );
+    let rebuilt = fs::read(root.path().join("theme/dist/fictional-default.crpack")).unwrap();
+    let mut archive = zip::ZipArchive::new(Cursor::new(&rebuilt)).unwrap();
+    assert!(archive.by_name("corona.json").is_ok());
+    assert!(archive.by_name("canora.json").is_err());
+    assert_eq!(crpack::parse_crpack(&rebuilt).unwrap().replacements, files);
+}
+
+#[test]
+fn conflicting_new_and_legacy_manifests_fail_before_import_publication() {
+    let files = BTreeMap::from([("app/icons/test.bin".into(), template(2, 0x10))]);
+    let root = fixture(&files, &files, &standard_manifest());
+    let mut both = files.clone();
+    both.insert(
+        "canora.json".into(),
+        serde_json::to_vec(&standard_manifest()).unwrap(),
+    );
+    fs::write(
+        root.path().join("input.crpack"),
+        archive(&serde_json::to_vec(&standard_manifest()).unwrap(), &both),
+    )
+    .unwrap();
+    assert!(rejected(root.path()).to_string().contains("not both"));
 }
 
 #[test]
@@ -436,7 +498,7 @@ fn non_utf8_paths_special_inputs_and_dangling_destination_symlinks_are_rejected(
     let bad = root
         .path()
         .join(std::ffi::OsString::from_vec(b"theme-\xff".to_vec()));
-    let output = Command::new(env!("CARGO_BIN_EXE_conora"))
+    let output = Command::new(env!("CARGO_BIN_EXE_corona"))
         .current_dir(root.path())
         .args([
             "import",
@@ -542,7 +604,7 @@ fn imported_target_accepts_explicit_dotted_id_device_and_firmware_pin() {
         true,
     );
     let config = read_json(&root.path().join("nested/theme/targets/p67.v1.json"));
-    let loaded = conora_core::project::load_firmware(&root.path().join("watch.bin"), None).unwrap();
+    let loaded = corona_core::project::load_firmware(&root.path().join("watch.bin"), None).unwrap();
     assert_eq!(config["firmwareSha256"], loaded.sha256);
     assert_eq!(report["firmwareSha256"], config["firmwareSha256"]);
     assert_eq!(config["device"], "Fictional Watch");
@@ -712,7 +774,7 @@ fn native_only_and_mixed_pack_import_preserves_canopus_and_quickapp_bytes() {
             .unwrap();
             assert_eq!(pack.replacements["canopus/manager_icon.bin"], image);
             assert_eq!(
-                pack.replacements[&conora_core::app_icons::destination("org.example.app")],
+                pack.replacements[&corona_core::app_icons::destination("org.example.app")],
                 image
             );
             assert_eq!(pack.quickapp_icons.len(), 1);
@@ -826,7 +888,7 @@ fn shared_opaque_quickapp_keys_with_trailing_slash_import_build_and_preview() {
     let packages = ["", "single", " 快应用 ", "a..b", r"C:\foo:bar", "a\u{0085}"];
     let trailing = "../../快应用/";
     let mut original_manifest = manifest(json!([{
-        "source": conora_core::app_icons::source(trailing), "destination":"native/shared.bin"
+        "source": corona_core::app_icons::source(trailing), "destination":"native/shared.bin"
     }]));
     original_manifest["quickappIcons"] = json!(packages.map(|package| json!({
         "package":package, "destination":"native/shared.bin"
@@ -863,7 +925,7 @@ fn shared_opaque_quickapp_keys_with_trailing_slash_import_build_and_preview() {
     assert_eq!(pack.quickapp_icons.len(), packages.len() + 1);
     assert!(pack.mappings.is_empty());
     for package in packages.into_iter().chain([trailing]) {
-        let destination = conora_core::app_icons::destination(package);
+        let destination = corona_core::app_icons::destination(package);
         assert!(
             pack.quickapp_icons
                 .iter()

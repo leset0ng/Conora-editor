@@ -1,5 +1,5 @@
 [package]
-name = "conora"
+name = "corona"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
@@ -9,11 +9,11 @@ repository = "https://github.com/leset0ng/Conora-editor"
 readme = "README.md"
 
 [[bin]]
-name = "conora"
+name = "corona"
 path = "src/main.rs"
 
 [dependencies]
-conora-core = { path = "../conora-core", version = "0.2.2" }
+corona-core = { path = "../corona-core", version = "0.2.2" }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

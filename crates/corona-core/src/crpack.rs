@@ -14,6 +14,12 @@ const MAX_MAPPINGS: usize = 256;
 const MAX_CONFIG_BYTES: usize = 32 * 1024;
 const MAX_PATH_BYTES: usize = 256;
 const THEME_ROOT: &str = "/data/quickapp/files/ng.lst.corona/themes/";
+const MANIFEST_NAME: &str = "corona.json";
+const LEGACY_MANIFEST_NAME: &str = "canora.json";
+
+fn is_manifest_name(path: &str) -> bool {
+    matches!(path, MANIFEST_NAME | LEGACY_MANIFEST_NAME)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnpackedCrpack {
@@ -29,15 +35,15 @@ pub struct UnpackedCrpack {
     /// Optional application declarations, separate from firmware mappings.
     pub quickapp_icons: Vec<QuickappIcon>,
     pub targets: Vec<String>,
-    /// Original manifest, including unknown fields, for verbatim CLI extraction/transfer.
+    /// Original manifest bytes, including unknown fields; output uses the canonical filename.
     pub manifest_bytes: Vec<u8>,
 }
 
 impl UnpackedCrpack {
-    /// All ordinary files to extract or transfer, including the root manifest.
+    /// All ordinary files to extract or transfer, normalizing the root manifest filename.
     /// Transport-specific file count and chunk limits are deliberately not archive limits.
     pub fn files(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        std::iter::once(("canora.json", self.manifest_bytes.as_slice())).chain(
+        std::iter::once((MANIFEST_NAME, self.manifest_bytes.as_slice())).chain(
             self.replacements
                 .iter()
                 .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
@@ -198,15 +204,15 @@ pub fn build_crpack_with_mappings(
     }
 
     let manifest_bytes = serde_json::to_vec_pretty(&Value::Object(manifest))
-        .map_err(|error| format!("could not serialize canora.json: {error}"))?;
+        .map_err(|error| format!("could not serialize corona.json: {error}"))?;
     if manifest_bytes.len() > MAX_MANIFEST_BYTES {
-        return Err("canora.json exceeds the 64 KiB CRPack v1 limit".into());
+        return Err("corona.json exceeds the 64 KiB CRPack v1 limit".into());
     }
     total_bytes = total_bytes
         .checked_add(manifest_bytes.len())
         .ok_or_else(|| "CRPack total byte count overflow".to_string())?;
     if total_bytes > MAX_TOTAL_BYTES {
-        return Err("replacement files plus canora.json exceed the 64 MiB CRPack limit".into());
+        return Err("replacement files plus corona.json exceed the 64 MiB CRPack limit".into());
     }
 
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -214,11 +220,11 @@ pub fn build_crpack_with_mappings(
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(6));
     writer
-        .start_file("canora.json", file_options)
-        .map_err(|error| format!("could not add canora.json to CRPack: {error}"))?;
+        .start_file(MANIFEST_NAME, file_options)
+        .map_err(|error| format!("could not add corona.json to CRPack: {error}"))?;
     writer
         .write_all(&manifest_bytes)
-        .map_err(|error| format!("could not write canora.json: {error}"))?;
+        .map_err(|error| format!("could not write corona.json: {error}"))?;
 
     for (path, contents) in options.replacements {
         writer
@@ -240,8 +246,9 @@ pub fn parse_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
     validate_crpack(bytes)
 }
 
-/// Validate and safely decompress CRPack v1 without rewriting paths or mapping rules.
-/// The 64 MiB budget includes canora.json; no container file-count limit is imposed.
+/// Validate and safely decompress CRPack v1, accepting one canonical or legacy manifest.
+/// Resource paths, manifest bytes and mapping rules are preserved.
+/// The 64 MiB budget includes corona.json; no container file-count limit is imposed.
 pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| format!("could not open CRPack archive: {error}"))?;
@@ -272,8 +279,11 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
         if body.rsplit('/').next() == Some("mappings.tsv") {
             return Err("CRPack must not contain reserved mappings.tsv".into());
         }
-        if directory && body == "canora.json" {
-            return Err("canora.json must be an ordinary file at the ZIP root".into());
+        if directory && is_manifest_name(body) {
+            return Err(format!("{body} must be an ordinary file at the ZIP root"));
+        }
+        if is_manifest_name(&path) && manifest_bytes.is_some() {
+            return Err("CRPack must contain exactly one manifest: corona.json or legacy canora.json, not both".into());
         }
         if raw.encrypted() {
             return Err(format!("encrypted ZIP entry is not supported: {path}"));
@@ -297,7 +307,7 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
             return Err(format!("symlink ZIP entry is not supported: {path}"));
         }
         let remaining = MAX_TOTAL_BYTES - total_bytes;
-        let budget = if path == "canora.json" {
+        let budget = if is_manifest_name(&path) {
             remaining.min(MAX_MANIFEST_BYTES)
         } else {
             remaining
@@ -320,25 +330,25 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
         if directory {
             continue; // Still read to EOF to check CRC and actual decompressed size.
         }
-        if path == "canora.json" {
+        if is_manifest_name(&path) {
             manifest_bytes = Some(contents);
         } else {
             replacements.insert(path, contents);
         }
     }
     validate_file_ancestors(seen.iter().map(String::as_str), &replacements)?;
-    let manifest_bytes =
-        manifest_bytes.ok_or_else(|| "missing canora.json in CRPack".to_string())?;
+    let manifest_bytes = manifest_bytes
+        .ok_or_else(|| "missing corona.json (or legacy canora.json) in CRPack".to_string())?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("invalid canora.json: {error}"))?;
+        .map_err(|error| format!("invalid corona.json: {error}"))?;
     let obj = manifest
         .as_object()
-        .ok_or_else(|| "canora.json must be a JSON object".to_string())?;
+        .ok_or_else(|| "corona.json must be a JSON object".to_string())?;
     if obj.get("format").and_then(Value::as_str) != Some("canopus-resource-pack") {
-        return Err("missing or unsupported format in canora.json".into());
+        return Err("missing or unsupported format in corona.json".into());
     }
     if obj.get("formatVersion").and_then(Value::as_u64) != Some(1) {
-        return Err("missing or unsupported formatVersion in canora.json".into());
+        return Err("missing or unsupported formatVersion in corona.json".into());
     }
     let theme_id = required_string(obj, "themeId")?.to_string();
     let name = required_string(obj, "name")?.to_string();
@@ -373,7 +383,7 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
     let values = obj
         .get("mappings")
         .and_then(Value::as_array)
-        .ok_or_else(|| "canora.json missing or invalid 'mappings' array".to_string())?;
+        .ok_or_else(|| "corona.json missing or invalid 'mappings' array".to_string())?;
     if values.len() > MAX_MAPPINGS {
         return Err(format!("CRPack v1 allows at most {MAX_MAPPINGS} mappings"));
     }
@@ -416,7 +426,7 @@ fn validate_file_ancestors<'a>(
     for path in paths {
         for (index, _) in path.match_indices('/') {
             let ancestor = &path[..index];
-            if files.contains_key(ancestor) || ancestor == "canora.json" {
+            if files.contains_key(ancestor) || is_manifest_name(ancestor) {
                 return Err(format!("ZIP file/directory conflict: {ancestor}"));
             }
         }
@@ -428,7 +438,7 @@ fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a 
     object
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("canora.json missing or invalid '{key}' string"))
+        .ok_or_else(|| format!("corona.json missing or invalid '{key}' string"))
 }
 
 fn optional_string(object: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
@@ -438,7 +448,7 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Result<Option<Stri
             value
                 .as_str()
                 .map(str::to_string)
-                .ok_or_else(|| format!("canora.json '{key}' must be a string"))
+                .ok_or_else(|| format!("corona.json '{key}' must be a string"))
         })
         .transpose()
 }
@@ -498,7 +508,7 @@ fn validate_central_directory(
         count += 1;
     }
     if count != indexed_count {
-        return Err("duplicate ZIP entries (canora.json must appear exactly once)".into());
+        return Err("duplicate ZIP entries (corona.json must appear exactly once)".into());
     }
     Ok(())
 }
@@ -716,7 +726,9 @@ fn validate_optional_text(
 }
 
 pub fn validate_relative_path(path: &str) -> Result<(), String> {
-    if path == "canora.json" || path.rsplit('/').next() == Some("mappings.tsv") {
+    if is_manifest_name(path.split('/').next().unwrap_or(""))
+        || path.rsplit('/').next() == Some("mappings.tsv")
+    {
         return Err(format!(
             "{path} is reserved and must not be included as a replacement"
         ));
@@ -783,7 +795,7 @@ fn validate_relative_destination(path: &str) -> Result<(), String> {
     {
         return Err(format!("unsafe CRPack destination: {path:?}"));
     }
-    Ok(())
+    validate_relative_path(body)
 }
 
 #[cfg(test)]
@@ -814,7 +826,7 @@ mod tests {
         assert_eq!(archive.len(), 3);
 
         let manifest: Value = serde_json::from_slice(&{
-            let mut file = archive.by_name("canora.json").unwrap();
+            let mut file = archive.by_name("corona.json").unwrap();
             let mut data = Vec::new();
             file.read_to_end(&mut data).unwrap();
             data
@@ -827,14 +839,15 @@ mod tests {
         assert_eq!(manifest["mappings"][0]["source"], "/resource/app/");
         assert_eq!(manifest["mappings"][0]["destination"], "app/");
         assert!(archive.by_name("app/common/icon/confirm.bin").is_ok());
-        assert!(archive.by_name("wrapper/canora.json").is_err());
+        assert!(archive.by_name("wrapper/corona.json").is_err());
+        assert!(archive.by_name(LEGACY_MANIFEST_NAME).is_err());
     }
 
     #[test]
     fn rejects_unsafe_paths_and_more_than_256_mapping_roots() {
         assert!(validate_relative_path("../escape.bin").is_err());
         assert!(validate_relative_path("app\\escape.bin").is_err());
-        assert!(validate_relative_path("canora.json").is_err());
+        assert!(validate_relative_path("corona.json").is_err());
         assert!(validate_relative_path("mappings.tsv").is_err());
         let replacements = (0..257)
             .map(|index| (format!("root{index:02}/image.bin"), vec![1]))
@@ -892,7 +905,7 @@ mod tests {
 
             let mut manifest_bytes = Vec::new();
             archive
-                .by_name("canora.json")
+                .by_name("corona.json")
                 .unwrap()
                 .read_to_end(&mut manifest_bytes)
                 .unwrap();
@@ -907,22 +920,22 @@ mod tests {
         assert!(parse_crpack(&[]).is_err());
         assert!(parse_crpack(b"not a zip file").is_err());
 
-        // Create zip without canora.json
+        // Create zip without corona.json
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let file_options = SimpleFileOptions::default();
         writer.start_file("app/test.bin", file_options).unwrap();
         writer.write_all(b"123").unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let err = parse_crpack(&bytes).unwrap_err();
-        assert!(err.contains("missing canora.json"));
+        assert!(err.contains("missing corona.json"));
     }
 
     #[test]
     fn parse_crpack_rejects_unsafe_paths_and_accepts_empty_mappings() {
-        // Zip with only canora.json (no replacements)
+        // Zip with only corona.json (no replacements)
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let file_options = SimpleFileOptions::default();
-        writer.start_file("canora.json", file_options).unwrap();
+        writer.start_file("corona.json", file_options).unwrap();
         let manifest = json!({
             "format": "canopus-resource-pack",
             "formatVersion": 1,
@@ -941,7 +954,7 @@ mod tests {
 
         // Zip with path traversal
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer.start_file("canora.json", file_options).unwrap();
+        writer.start_file("corona.json", file_options).unwrap();
         writer
             .write_all(&serde_json::to_vec(&manifest).unwrap())
             .unwrap();
@@ -960,9 +973,17 @@ mod tests {
     }
 
     fn archive_with(manifest: &Value, entries: &[(&str, &[u8])]) -> Vec<u8> {
+        archive_with_manifest_name(MANIFEST_NAME, manifest, entries)
+    }
+
+    fn archive_with_manifest_name(
+        name: &str,
+        manifest: &Value,
+        entries: &[(&str, &[u8])],
+    ) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        writer.start_file("canora.json", opts).unwrap();
+        writer.start_file(name, opts).unwrap();
         writer
             .write_all(&serde_json::to_vec(manifest).unwrap())
             .unwrap();
@@ -975,6 +996,126 @@ mod tests {
             }
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn legacy_import_preserves_manifest_bytes_but_outputs_only_the_canonical_name() {
+        let mut metadata = manifest();
+        metadata["extra"] = json!({"preserve": true});
+        for name in [MANIFEST_NAME, LEGACY_MANIFEST_NAME] {
+            let bytes = archive_with_manifest_name(name, &metadata, &[("icon.bin", b"x")]);
+            let unpacked = parse_crpack(&bytes).unwrap();
+            assert_eq!(
+                unpacked.manifest_bytes,
+                serde_json::to_vec(&metadata).unwrap()
+            );
+            let files: Vec<_> = unpacked.files().collect();
+            assert_eq!(
+                files[0],
+                (MANIFEST_NAME, unpacked.manifest_bytes.as_slice())
+            );
+            assert!(!files.iter().any(|(name, _)| *name == LEGACY_MANIFEST_NAME));
+            let rebuilt = build_crpack_with_mappings(
+                &options(&unpacked.replacements),
+                &unpacked.mappings,
+                &unpacked.quickapp_icons,
+            )
+            .unwrap();
+            let mut archive = ZipArchive::new(Cursor::new(rebuilt)).unwrap();
+            assert!(archive.by_name(MANIFEST_NAME).is_ok());
+            assert!(archive.by_name(LEGACY_MANIFEST_NAME).is_err());
+        }
+        let mut empty = metadata;
+        empty["mappings"] = json!([]);
+        assert!(
+            parse_crpack(&archive_with_manifest_name(
+                LEGACY_MANIFEST_NAME,
+                &empty,
+                &[]
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn both_manifest_names_are_rejected_in_either_order_without_fallback() {
+        let valid = serde_json::to_vec(&manifest()).unwrap();
+        for (first, second) in [
+            (MANIFEST_NAME, LEGACY_MANIFEST_NAME),
+            (LEGACY_MANIFEST_NAME, MANIFEST_NAME),
+        ] {
+            let bytes = archive_with_manifest_name(
+                first,
+                &manifest(),
+                &[("icon.bin", b"x"), (second, &valid)],
+            );
+            assert!(parse_crpack(&bytes).unwrap_err().contains("not both"));
+        }
+        let invalid = archive_with_manifest_name(
+            LEGACY_MANIFEST_NAME,
+            &manifest(),
+            &[("icon.bin", b"x"), (MANIFEST_NAME, b"not json")],
+        );
+        assert!(parse_crpack(&invalid).is_err());
+        let invalid = archive_with_manifest_name(MANIFEST_NAME, &json!({}), &[("icon.bin", b"x")]);
+        assert!(parse_crpack(&invalid).is_err());
+    }
+
+    #[test]
+    fn both_manifest_names_are_reserved_and_cannot_be_directories_or_ancestors() {
+        for name in [MANIFEST_NAME, LEGACY_MANIFEST_NAME] {
+            for path in [
+                name.to_string(),
+                format!("{name}/"),
+                format!("{name}/child"),
+            ] {
+                assert!(validate_relative_path(&path).is_err(), "{path}");
+                assert!(validate_relative_destination(&path).is_err(), "{path}");
+                let replacements = BTreeMap::from([(path.clone(), vec![1])]);
+                assert!(build_crpack(&options(&replacements)).is_err(), "{path}");
+                let other = if name == MANIFEST_NAME {
+                    LEGACY_MANIFEST_NAME
+                } else {
+                    MANIFEST_NAME
+                };
+                let bytes = archive_with_manifest_name(
+                    other,
+                    &manifest(),
+                    &[("icon.bin", b"x"), (&path, b"x")],
+                );
+                assert!(parse_crpack(&bytes).is_err(), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_and_legacy_manifests_have_identical_decompression_and_crc_limits() {
+        for name in [MANIFEST_NAME, LEGACY_MANIFEST_NAME] {
+            let mut oversized = manifest();
+            oversized["extra"] = json!("x".repeat(MAX_MANIFEST_BYTES));
+            let mut bytes = archive_with_manifest_name(name, &oversized, &[("icon.bin", b"x")]);
+            assert!(
+                parse_crpack(&bytes)
+                    .unwrap_err()
+                    .contains("decompression limit")
+            );
+            let central = central_offsets(&bytes)[0];
+            bytes[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+            assert!(
+                parse_crpack(&bytes)
+                    .unwrap_err()
+                    .contains("decompression limit")
+            );
+
+            let mut bytes = archive_with_manifest_name(name, &manifest(), &[("icon.bin", b"x")]);
+            let start = ZipArchive::new(Cursor::new(&bytes))
+                .unwrap()
+                .by_index_raw(0)
+                .unwrap()
+                .data_start() as usize;
+            bytes[start] ^= 1;
+            assert!(parse_crpack(&bytes).unwrap_err().contains("extract"));
+        }
     }
 
     fn central_offsets(bytes: &[u8]) -> Vec<usize> {
@@ -1101,7 +1242,7 @@ mod tests {
             ("/resource/icon.bin", "missing.bin"),
             ("/resource/", "empty/"),
             ("/resource/", "icon.bin"),
-            ("/resource/icon.bin", "canora.json"),
+            ("/resource/icon.bin", "corona.json"),
             ("/resource/", "icons2/"),
         ] {
             let mut manifest = manifest();
@@ -1173,7 +1314,7 @@ mod tests {
             "a\\b/",
             "mappings.tsv",
             "nested/mappings.tsv",
-            "canora.json/",
+            "corona.json/",
         ] {
             let bytes = archive_with(&manifest(), &[("icon.bin", b"x"), (path, b"")]);
             assert!(validate_crpack(&bytes).is_err(), "{path}");
@@ -1192,7 +1333,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_manifest_and_resource_entries_hidden_by_zip_index() {
         // ZipWriter itself prohibits duplicate names, so replace an equal-length name.
-        for (old, new) in [("second.json", "canora.json"), ("copy.bin", "icon.bin")] {
+        for (old, new) in [("second.json", "corona.json"), ("copy.bin", "icon.bin")] {
             let mut bytes = archive_with(&manifest(), &[("icon.bin", b"x"), (old, b"x")]);
             assert_eq!(old.len(), new.len());
             let positions: Vec<usize> = bytes
@@ -1293,7 +1434,7 @@ mod tests {
     fn actual_total_budget_includes_manifest_despite_forged_resource_size() {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        writer.start_file("canora.json", opts).unwrap();
+        writer.start_file("corona.json", opts).unwrap();
         writer
             .write_all(&serde_json::to_vec(&manifest()).unwrap())
             .unwrap();
@@ -1317,13 +1458,11 @@ mod tests {
     fn builder_rejects_file_directory_conflicts_and_manifest_ancestors() {
         for replacements in [
             BTreeMap::from([("file".into(), vec![1]), ("file/child".into(), vec![1])]),
+            BTreeMap::from([("corona.json/child".into(), vec![1])]),
             BTreeMap::from([("canora.json/child".into(), vec![1])]),
         ] {
-            assert!(
-                build_crpack(&options(&replacements))
-                    .unwrap_err()
-                    .contains("conflict")
-            );
+            let error = build_crpack(&options(&replacements)).unwrap_err();
+            assert!(error.contains("conflict") || error.contains("reserved"));
         }
         let directory = format!("{}/", "x".repeat(255));
         assert!(
