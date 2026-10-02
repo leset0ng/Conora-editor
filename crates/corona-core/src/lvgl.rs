@@ -80,7 +80,11 @@ impl std::str::FromStr for ResizeFilter {
 type Rgba = [u8; 4];
 
 fn pixel_color(pixel: &[u8; 4]) -> Rgba {
-    *pixel
+    if pixel[3] == 0 {
+        [0, 0, 0, 0]
+    } else {
+        *pixel
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -965,7 +969,10 @@ pub fn encode_png_to_template_with_filter(
                     .enumerate()
                     .rev()
                 {
-                    orig_lookup.insert([entry[2], entry[1], entry[0], entry[3]], idx as u8);
+                    orig_lookup.insert(
+                        pixel_color(&[entry[2], entry[1], entry[0], entry[3]]),
+                        idx as u8,
+                    );
                 }
             }
 
@@ -1243,13 +1250,41 @@ fn unique_colors(rgba: &[u8]) -> Result<(Vec<Rgba>, Vec<u64>), String> {
             return Err("PNG contains too many distinct colors to quantize safely".into());
         }
     }
-    let mut colors = Vec::with_capacity(counts.len());
-    let mut frequencies = Vec::with_capacity(counts.len());
-    for (color, count) in counts {
+    let mut items = counts.into_iter().collect::<Vec<_>>();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut colors = Vec::with_capacity(items.len());
+    let mut frequencies = Vec::with_capacity(items.len());
+    for (color, count) in items {
         colors.push(color);
         frequencies.push(count);
     }
     Ok((colors, frequencies))
+}
+
+fn color_distance_sq(c1: Rgba, c2: Rgba) -> u64 {
+    if c1[3] == 0 && c2[3] == 0 {
+        return 0;
+    }
+    if c1[3] == 0 || c2[3] == 0 {
+        let da = (c1[3] as i64) - (c2[3] as i64);
+        return (da * da * 16) as u64 + 255 * 255 * 16;
+    }
+
+    let a1 = c1[3] as i64;
+    let a2 = c2[3] as i64;
+    let r1 = (c1[0] as i64 * a1) / 255;
+    let r2 = (c2[0] as i64 * a2) / 255;
+    let g1 = (c1[1] as i64 * a1) / 255;
+    let g2 = (c2[1] as i64 * a2) / 255;
+    let b1 = (c1[2] as i64 * a1) / 255;
+    let b2 = (c2[2] as i64 * a2) / 255;
+
+    let dr = r1 - r2;
+    let dg = g1 - g2;
+    let db = b1 - b2;
+    let da = a1 - a2;
+
+    (3 * dr * dr + 4 * dg * dg + 2 * db * db + 4 * da * da) as u64
 }
 
 #[derive(Clone)]
@@ -1263,6 +1298,9 @@ fn median_cut_palette(
     counts: Vec<u64>,
     max_colors: usize,
 ) -> Result<(Vec<Rgba>, HashMap<Rgba, u8>), String> {
+    let all_colors = colors.clone();
+    let has_zero_alpha = all_colors.iter().any(|c| c[3] == 0);
+
     let initial = colors
         .into_iter()
         .zip(counts)
@@ -1277,7 +1315,8 @@ fn median_cut_palette(
             .filter(|(_, colors)| colors.len() > 1)
             .map(|(index, colors)| {
                 let (channel, range) = widest_channel(colors);
-                (index, channel, u64::from(range) * colors.len() as u64)
+                let total_count = colors.iter().map(|item| item.count).sum::<u64>();
+                (index, channel, u64::from(range) * total_count)
             })
             .max_by_key(|(_, _, score)| *score);
         let Some((index, channel, _)) = candidate else {
@@ -1302,24 +1341,45 @@ fn median_cut_palette(
     }
 
     let mut palette = Vec::with_capacity(boxes.len());
-    let mut lookup = HashMap::new();
-    for (index, bucket) in boxes.into_iter().enumerate() {
+    for bucket in &boxes {
         let total = bucket.iter().map(|item| item.count).sum::<u64>().max(1);
         let mut sums = [0u64; 4];
-        for item in &bucket {
+        for item in bucket {
             for (channel, component) in item.color.iter().enumerate() {
                 sums[channel] += u64::from(*component) * item.count;
             }
         }
         let color = sums.map(|value| ((value + total / 2) / total) as u8);
-        for item in bucket {
-            lookup.insert(item.color, index as u8);
-        }
         palette.push(color);
     }
+
+    if has_zero_alpha && !palette.iter().any(|c| c[3] == 0) {
+        if let Some((idx, _)) = palette.iter().enumerate().min_by_key(|(_, c)| c[3]) {
+            palette[idx] = [0, 0, 0, 0];
+        }
+    }
+
     if palette.is_empty() || palette.len() > max_colors {
         return Err("could not construct an LVGL palette".into());
     }
+
+    let mut lookup = HashMap::with_capacity(all_colors.len());
+    for color in all_colors {
+        let mut best_index = 0u8;
+        let mut best_dist = u64::MAX;
+        for (idx, &pal_color) in palette.iter().enumerate() {
+            let dist = color_distance_sq(color, pal_color);
+            if dist < best_dist {
+                best_dist = dist;
+                best_index = idx as u8;
+                if dist == 0 {
+                    break;
+                }
+            }
+        }
+        lookup.insert(color, best_index);
+    }
+
     Ok((palette, lookup))
 }
 
@@ -1862,5 +1922,69 @@ mod tests {
         let rle_restored = encode_png_to_template(&rle_png, &rle_original, false).unwrap();
         let (_, rle_restored_png) = decode_image_png(&rle_restored).unwrap();
         assert_eq!(rle_restored_png, png);
+    }
+
+    #[test]
+    fn quantization_normalizes_zero_alpha_and_preserves_clean_transparency() {
+        let pixel_offset = HEADER_BYTES_V9 + PALETTE_BYTES_I8;
+        let mut template = vec![0u8; pixel_offset + 320];
+        template[0] = 0x19;
+        template[1] = 0x0a; // Lvgl9I8
+        template[4..6].copy_from_slice(&320u16.to_le_bytes());
+        template[6..8].copy_from_slice(&1u16.to_le_bytes());
+        template[8..10].copy_from_slice(&320u16.to_le_bytes());
+
+        // Create an image with >256 colors where transparent pixels have different dirty RGBs
+        let mut pixels = Vec::new();
+        // 50 completely transparent pixels with varying RGB noise (will normalize to [0,0,0,0])
+        for i in 0..50u8 {
+            pixels.extend_from_slice(&[i, 255 - i, i.wrapping_mul(3), 0]);
+        }
+        // 270 opaque pixels with distinct colors, guaranteeing > 256 distinct colors even after normalization
+        for i in 0..270u16 {
+            pixels.extend_from_slice(&[(i % 256) as u8, (i / 256) as u8, 100, 255]);
+        }
+        let image = RgbaImage::from_raw(320, 1, pixels).unwrap();
+        let png = png_bytes(image);
+
+        let quantized = encode_png_to_template_detailed(&png, &template, true).unwrap();
+        assert!(quantized.lossy_quantization);
+
+        let (_, decoded) = decode_to_rgba(&quantized.bytes).unwrap();
+        // All first 50 pixels must be decoded as completely transparent
+        for x in 0..50 {
+            let px = decoded.get_pixel(x, 0);
+            assert_eq!(px[3], 0, "pixel at ({x}, 0) should remain fully transparent");
+        }
+    }
+
+    #[test]
+    fn quantization_nearest_color_remapping_prevents_extreme_color_jumps() {
+        let pixel_offset = HEADER_BYTES_V9 + PALETTE_BYTES_I8;
+        let mut template = vec![0u8; pixel_offset + 260];
+        template[0] = 0x19;
+        template[1] = 0x0a; // Lvgl9I8
+        template[4..6].copy_from_slice(&260u16.to_le_bytes());
+        template[6..8].copy_from_slice(&1u16.to_le_bytes());
+        template[8..10].copy_from_slice(&260u16.to_le_bytes());
+
+        // Construct 260 smoothly gradient colors
+        let mut pixels = Vec::new();
+        for i in 0..260u32 {
+            let val = ((i * 255) / 259) as u8;
+            pixels.extend_from_slice(&[val, val, val, 255]);
+        }
+        let image = RgbaImage::from_raw(260, 1, pixels).unwrap();
+        let png = png_bytes(image);
+
+        let quantized = encode_png_to_template_detailed(&png, &template, true).unwrap();
+        let (_, decoded) = decode_to_rgba(&quantized.bytes).unwrap();
+
+        // Adjacent pixels in a smooth ramp must not have large salt-and-pepper leaps
+        for x in 0..259 {
+            let p1 = decoded.get_pixel(x, 0)[0] as i32;
+            let p2 = decoded.get_pixel(x + 1, 0)[0] as i32;
+            assert!((p1 - p2).abs() <= 10, "step between adjacent pixels too large: {p1} vs {p2}");
+        }
     }
 }

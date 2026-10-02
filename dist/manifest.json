@@ -1,7 +1,7 @@
 {
   "name": "Corona CRPack Builder",
   "icon": "icon.png",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "从手环固件资源树创建 Corona CRPack v1 主题包",
   "author": "lesetong",
   "website": "https://leseto.ng",
