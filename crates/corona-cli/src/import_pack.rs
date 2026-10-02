@@ -454,6 +454,9 @@ pub(super) fn run(args: Import) -> Result<Value> {
             theme[key] = json!(value);
         }
     }
+    if let Some(version_code) = pack.version_code {
+        theme["versionCode"] = json!(version_code);
+    }
     let mut target = json!({
         "schemaVersion": 1, "firmware": firmware_relative,
         "firmwareSha256": firmware.sha256, "bindings": bindings, "overrides": overrides

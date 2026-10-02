@@ -76,6 +76,7 @@ struct UiState {
     theme_id: String,
     pack_name: String,
     version: String,
+    version_code: String,
     author: String,
     description: String,
     target: String,
@@ -110,6 +111,7 @@ impl Default for UiState {
             theme_id: "corona".into(),
             pack_name: "Corona Resource Pack".into(),
             version: "1.0.0".into(),
+            version_code: "1".into(),
             author: String::new(),
             description: String::new(),
             target: String::new(),
@@ -153,6 +155,7 @@ struct UiSnapshot {
     theme_id: String,
     pack_name: String,
     version: String,
+    version_code: String,
     author: String,
     description: String,
     target: String,
@@ -401,6 +404,7 @@ fn snapshot(state: &mut UiState) -> UiSnapshot {
         theme_id: state.theme_id.clone(),
         pack_name: state.pack_name.clone(),
         version: state.version.clone(),
+        version_code: state.version_code.clone(),
         author: state.author.clone(),
         description: state.description.clone(),
         target: state.target.clone(),
@@ -605,6 +609,10 @@ fn process_change(event_id: &str, payload: &str) {
                 state.version = value;
                 false
             }
+            "pack.version_code" => {
+                state.version_code = value;
+                false
+            }
             "pack.author" => {
                 state.author = value;
                 false
@@ -801,6 +809,7 @@ async fn begin_crpack_pick() {
             state.theme_id = unpacked.theme_id;
             state.pack_name = unpacked.name;
             state.version = unpacked.version.unwrap_or_default();
+            state.version_code = unpacked.version_code.map(|v| v.to_string()).unwrap_or_default();
             state.author = unpacked.author.unwrap_or_default();
             state.description = unpacked.description.unwrap_or_default();
             if let Some(target) = unpacked.target
@@ -1160,13 +1169,27 @@ fn export_assets(state: &UiState) -> Result<ExportAssets, String> {
     Ok((replacements, mappings, declarations))
 }
 
+fn parse_version_code(raw: &str) -> Result<Option<u64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let code: u64 = trimmed
+        .parse()
+        .map_err(|_| "版本号 (versionCode) 必须是非负安全整数（0–9007199254740991）".to_string())?;
+    crpack::validate_version_code(code)?;
+    Ok(Some(code))
+}
+
 fn build_project_pack(state: &UiState) -> Result<Vec<u8>, String> {
     let (replacements, mappings, declarations) = export_assets(state)?;
+    let version_code = parse_version_code(&state.version_code)?;
     crpack::build_crpack_with_mappings(
         &PackOptions {
             theme_id: &state.theme_id,
             name: &state.pack_name,
             version: (!state.version.is_empty()).then_some(state.version.as_str()),
+            version_code,
             author: (!state.author.is_empty()).then_some(state.author.as_str()),
             description: (!state.description.is_empty()).then_some(state.description.as_str()),
             target: (!state.target.is_empty()).then_some(state.target.as_str()),
@@ -3027,7 +3050,13 @@ fn build_inspector(state: &UiSnapshot) -> ui::Element {
             "pack.name",
             "Corona Resource Pack",
         ))
-        .child(field("版本", &state.version, "pack.version", "1.0.0"))
+        .child(field("版本名", &state.version, "pack.version", "1.0.0"))
+        .child(field(
+            "版本号（数字）",
+            &state.version_code,
+            "pack.version_code",
+            "1",
+        ))
         .child(field("作者（可选）", &state.author, "pack.author", ""))
         .child(field(
             "目标设备（可选）",
@@ -3289,6 +3318,7 @@ mod tests {
                 theme_id: "corona",
                 name: "Custom",
                 version: None,
+                version_code: None,
                 author: None,
                 description: None,
                 target: None,
@@ -3417,6 +3447,7 @@ mod tests {
                 theme_id: "corona",
                 name: "Icons",
                 version: None,
+                version_code: None,
                 author: None,
                 description: None,
                 target: None,
@@ -3711,5 +3742,71 @@ mod tests {
             format_firmware_name(long_name),
             "miwear.watch.p…a4ce8564.bin"
         );
+    }
+
+    #[test]
+    fn editor_default_builds_pack_with_default_version_code() {
+        let mut state = UiState::default();
+        state
+            .replacements
+            .insert("app/icon.bin".into(), vec![1, 2, 3]);
+        let bytes = build_project_pack(&state).unwrap();
+        let unpacked = parse_ui_pack(&bytes).unwrap();
+        assert_eq!(unpacked.version.as_deref(), Some("1.0.0"));
+        assert_eq!(unpacked.version_code, Some(1));
+    }
+
+    #[test]
+    fn editor_version_code_change_and_validation() {
+        let mut state = UiState::default();
+        state
+            .replacements
+            .insert("app/icon.bin".into(), vec![1, 2, 3]);
+
+        // Custom valid integer
+        state.version_code = "42".into();
+        let bytes = build_project_pack(&state).unwrap();
+        let unpacked = parse_ui_pack(&bytes).unwrap();
+        assert_eq!(unpacked.version_code, Some(42));
+
+        // Empty string -> None
+        state.version_code = "  ".into();
+        let bytes = build_project_pack(&state).unwrap();
+        let unpacked = parse_ui_pack(&bytes).unwrap();
+        assert_eq!(unpacked.version_code, None);
+
+        // Invalid cases
+        for invalid in ["-1", "abc", "1.5", "9007199254740992"] {
+            state.version_code = invalid.into();
+            assert!(
+                build_project_pack(&state).is_err(),
+                "should reject invalid versionCode: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn editor_import_restores_version_code() {
+        let replacements = BTreeMap::from([("app/icon.bin".into(), vec![1, 2, 3])]);
+        let pack = crpack::build_crpack(&PackOptions {
+            theme_id: "corona",
+            name: "Test",
+            version: Some("2.0.0"),
+            version_code: Some(123),
+            author: None,
+            description: None,
+            target: None,
+            replacements: &replacements,
+        })
+        .unwrap();
+
+        let unpacked = parse_ui_pack(&pack).unwrap();
+        let mut state = UiState::default();
+        state.theme_id = unpacked.theme_id;
+        state.pack_name = unpacked.name;
+        state.version = unpacked.version.unwrap_or_default();
+        state.version_code = unpacked.version_code.map(|v| v.to_string()).unwrap_or_default();
+        assert_eq!(state.version, "2.0.0");
+        assert_eq!(state.version_code, "123");
     }
 }

@@ -12,6 +12,7 @@ fn options(files: &BTreeMap<String, Vec<u8>>) -> PackOptions<'_> {
         theme_id: "icons",
         name: "Application icons",
         version: None,
+        version_code: None,
         author: None,
         description: None,
         target: None,

@@ -37,6 +37,8 @@ pub struct Theme {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_code: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -275,6 +277,7 @@ pub fn load_theme(path: &Path) -> Result<ThemeProject, String> {
         &theme.theme_id,
         &theme.name,
         theme.version.as_deref(),
+        theme.version_code,
         theme.author.as_deref(),
         theme.description.as_deref(),
         None,
@@ -362,6 +365,7 @@ pub fn load_target(project: &ThemeProject, id: &str) -> Result<Target, String> {
         &project.theme.theme_id,
         &project.theme.name,
         project.theme.version.as_deref(),
+        project.theme.version_code,
         project.theme.author.as_deref(),
         project.theme.description.as_deref(),
         target.device.as_deref(),
@@ -771,6 +775,7 @@ pub fn prepare_target_with_progress(
             theme_id: &project.theme.theme_id,
             name: &project.theme.name,
             version: project.theme.version.as_deref(),
+            version_code: project.theme.version_code,
             author: project.theme.author.as_deref(),
             description: project.theme.description.as_deref(),
             target: target.device.as_deref(),

@@ -408,7 +408,7 @@ fn validate_theme_id(id: &str) -> Result<()> {
 }
 
 fn init(args: Init) -> Result<Value> {
-    crpack::validate_pack_metadata(&args.theme_id, &args.name, None, None, None, None)?;
+    crpack::validate_pack_metadata(&args.theme_id, &args.name, None, None, None, None, None)?;
     project::validate_target_id(&args.target)?;
     validate_device(args.device.as_deref())?;
     let root = absolute(&args.dir)?;
@@ -812,6 +812,7 @@ fn inspect(path: &Path) -> Result<Value> {
     Ok(json!({
         "pack": path,
         "metadata": { "themeId": pack.theme_id, "name": pack.name, "version": pack.version,
+            "versionCode": pack.version_code,
             "author": pack.author, "description": pack.description, "target": pack.target },
         "resourceCount": pack.replacements.len(), "packBytes": bytes.len(),
         "manifest": manifest, "targets": pack.targets, "mappings": mappings, "files": files

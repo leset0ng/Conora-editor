@@ -13,6 +13,7 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_MAPPINGS: usize = 256;
 const MAX_CONFIG_BYTES: usize = 32 * 1024;
 const MAX_PATH_BYTES: usize = 256;
+pub const MAX_VERSION_CODE: u64 = 9_007_199_254_740_991;
 const THEME_ROOT: &str = "/data/quickapp/files/ng.lst.corona/themes/";
 const MANIFEST_NAME: &str = "corona.json";
 const LEGACY_MANIFEST_NAME: &str = "canora.json";
@@ -26,6 +27,7 @@ pub struct UnpackedCrpack {
     pub theme_id: String,
     pub name: String,
     pub version: Option<String>,
+    pub version_code: Option<u64>,
     pub author: Option<String>,
     pub description: Option<String>,
     pub target: Option<String>,
@@ -56,6 +58,7 @@ pub struct PackOptions<'a> {
     pub theme_id: &'a str,
     pub name: &'a str,
     pub version: Option<&'a str>,
+    pub version_code: Option<u64>,
     pub author: Option<&'a str>,
     pub description: Option<&'a str>,
     pub target: Option<&'a str>,
@@ -74,11 +77,21 @@ pub struct QuickappIcon {
     pub destination: String,
 }
 
+pub fn validate_version_code(version_code: u64) -> Result<(), String> {
+    if version_code > MAX_VERSION_CODE {
+        return Err(format!(
+            "versionCode exceeds maximum safe integer ({MAX_VERSION_CODE})"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate authoring metadata independently of whether a project has assets yet.
 pub fn validate_pack_metadata(
     theme_id: &str,
     name: &str,
     version: Option<&str>,
+    version_code: Option<u64>,
     author: Option<&str>,
     description: Option<&str>,
     target: Option<&str>,
@@ -86,6 +99,9 @@ pub fn validate_pack_metadata(
     validate_theme_id(theme_id)?;
     validate_text(name, "name", 128, true)?;
     validate_optional_text(version, "version", 64)?;
+    if let Some(version_code) = version_code {
+        validate_version_code(version_code)?;
+    }
     validate_optional_text(author, "author", 128)?;
     if let Some(description) = description {
         validate_description(description)?;
@@ -129,6 +145,7 @@ pub fn build_crpack_with_mappings(
         options.theme_id,
         options.name,
         options.version,
+        options.version_code,
         options.author,
         options.description,
         options.target,
@@ -189,6 +206,9 @@ pub fn build_crpack_with_mappings(
     }
     if let Some(version) = options.version {
         manifest.insert("version".into(), Value::String(version.to_string()));
+    }
+    if let Some(version_code) = options.version_code {
+        manifest.insert("versionCode".into(), Value::Number(version_code.into()));
     }
     if let Some(author) = options.author {
         manifest.insert("author".into(), Value::String(author.to_string()));
@@ -353,12 +373,26 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
     let theme_id = required_string(obj, "themeId")?.to_string();
     let name = required_string(obj, "name")?.to_string();
     let version = optional_string(obj, "version")?;
+    let version_code = match obj.get("versionCode") {
+        None => None,
+        Some(value) => {
+            let number = value
+                .as_number()
+                .ok_or_else(|| "versionCode must be a non-negative safe integer".to_string())?;
+            let code = number
+                .as_u64()
+                .ok_or_else(|| "versionCode must be a non-negative safe integer".to_string())?;
+            validate_version_code(code)?;
+            Some(code)
+        }
+    };
     let author = optional_string(obj, "author")?;
     let description = optional_string(obj, "description")?;
     validate_pack_metadata(
         &theme_id,
         &name,
         version.as_deref(),
+        version_code,
         author.as_deref(),
         description.as_deref(),
         None,
@@ -407,6 +441,7 @@ pub fn validate_crpack(bytes: &[u8]) -> Result<UnpackedCrpack, String> {
         theme_id,
         name,
         version,
+        version_code,
         author,
         description,
         target: targets.first().cloned(),
@@ -809,6 +844,7 @@ mod tests {
             theme_id: "dark",
             name: "Dark",
             version: Some("1.0.0"),
+            version_code: Some(1),
             author: None,
             description: None,
             target: Some("xiaomi-band-11-4.100.155"),
@@ -834,6 +870,7 @@ mod tests {
         .unwrap();
         assert_eq!(manifest["format"], "canopus-resource-pack");
         assert_eq!(manifest["formatVersion"], 1);
+        assert_eq!(manifest["versionCode"], 1);
         assert_eq!(manifest["targets"][0], "xiaomi-band-11-4.100.155");
         assert_eq!(manifest["mappings"].as_array().unwrap().len(), 1);
         assert_eq!(manifest["mappings"][0]["source"], "/resource/app/");
@@ -871,6 +908,7 @@ mod tests {
             theme_id: "test_pack",
             name: "Test Theme",
             version: Some("1.2.3"),
+            version_code: Some(42),
             author: Some("Tester"),
             description: Some("Description of test"),
             target: Some("xiaomi-band-11-4.100.155"),
@@ -882,6 +920,7 @@ mod tests {
         assert_eq!(unpacked.theme_id, "test_pack");
         assert_eq!(unpacked.name, "Test Theme");
         assert_eq!(unpacked.version.as_deref(), Some("1.2.3"));
+        assert_eq!(unpacked.version_code, Some(42));
         assert_eq!(unpacked.author.as_deref(), Some("Tester"));
         assert_eq!(unpacked.description.as_deref(), Some("Description of test"));
         assert_eq!(unpacked.target.as_deref(), Some("xiaomi-band-11-4.100.155"));
@@ -1134,12 +1173,45 @@ mod tests {
 
     #[test]
     fn metadata_can_be_checked_without_assets() {
-        assert!(validate_pack_metadata("dark", "Dark", None, None, None, None).is_ok());
-        assert!(validate_pack_metadata("Dark", "Dark", None, None, None, None).is_err());
-        assert!(validate_pack_metadata("dark", "", None, None, None, None).is_err());
+        assert!(validate_pack_metadata("dark", "Dark", None, None, None, None, None).is_ok());
+        assert!(validate_pack_metadata("dark", "Dark", None, Some(1), None, None, None).is_ok());
         assert!(
-            validate_pack_metadata("dark", "Dark", Some(&"v".repeat(65)), None, None, None)
-                .is_err()
+            validate_pack_metadata(
+                "dark",
+                "Dark",
+                None,
+                Some(MAX_VERSION_CODE),
+                None,
+                None,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_pack_metadata(
+                "dark",
+                "Dark",
+                None,
+                Some(MAX_VERSION_CODE + 1),
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(validate_pack_metadata("Dark", "Dark", None, None, None, None, None).is_err());
+        assert!(validate_pack_metadata("dark", "", None, None, None, None, None).is_err());
+        assert!(
+            validate_pack_metadata(
+                "dark",
+                "Dark",
+                Some(&"v".repeat(65)),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
         );
     }
 
@@ -1200,6 +1272,11 @@ mod tests {
                 json!([{"source": 1, "destination": "icon.bin"}]),
             ),
             ("version", json!(5)),
+            ("versionCode", json!("1")),
+            ("versionCode", json!(-1)),
+            ("versionCode", json!(1.5)),
+            ("versionCode", json!(9_007_199_254_740_992_u64)),
+            ("versionCode", Value::Null),
             ("author", Value::Null),
             ("description", json!(false)),
             ("targets", json!("band")),
@@ -1502,7 +1579,7 @@ mod tests {
             assert!(validate_crpack(&archive_with(&imported, &[("icon.bin", b"x")])).is_err());
         }
         // Only descriptions permit these whitespace controls, not other metadata or paths.
-        assert!(validate_pack_metadata("dark", "Dark\n", None, None, None, None).is_err());
+        assert!(validate_pack_metadata("dark", "Dark\n", None, None, None, None, None).is_err());
         assert!(validate_relative_path("icons/\ticon.bin").is_err());
         assert!(validate_absolute_source("/resource/\nicon.bin").is_err());
         assert!(validate_relative_destination("icons/\ricon.bin").is_err());
@@ -1525,5 +1602,23 @@ mod tests {
         }
         let replacements = BTreeMap::from([(too_long, vec![1])]);
         assert!(build_crpack(&options(&replacements)).is_err());
+    }
+
+    #[test]
+    fn optional_version_code_omitted_or_present() {
+        let mut manifest_without = manifest();
+        manifest_without
+            .as_object_mut()
+            .unwrap()
+            .remove("versionCode");
+        let bytes = archive_with(&manifest_without, &[("icon.bin", b"x")]);
+        let unpacked = validate_crpack(&bytes).unwrap();
+        assert_eq!(unpacked.version_code, None);
+
+        let mut manifest_with = manifest();
+        manifest_with["versionCode"] = json!(100);
+        let bytes = archive_with(&manifest_with, &[("icon.bin", b"x")]);
+        let unpacked = validate_crpack(&bytes).unwrap();
+        assert_eq!(unpacked.version_code, Some(100));
     }
 }

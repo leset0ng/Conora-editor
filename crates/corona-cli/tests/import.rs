@@ -130,6 +130,7 @@ fn manifest(mappings: Value) -> Value {
     json!({
         "format": "canopus-resource-pack", "formatVersion": 1,
         "themeId": "fictional", "name": "Fictional Icons", "version": "1.2",
+        "versionCode": 3,
         "author": "Local Fixture", "description": "Not watch firmware",
         "targets": ["fictional-watch", "fictional-watch-2"],
         "extra": {"preserve": true}, "mappings": mappings
@@ -201,7 +202,7 @@ fn fictional_two_image_and_all_forty_image_roundtrip_preserve_originals() {
             parsed.manifest_bytes
         );
         let theme = read_json(&root.path().join("theme/theme.json"));
-        for key in ["themeId", "name", "version", "author", "description"] {
+        for key in ["themeId", "name", "version", "versionCode", "author", "description"] {
             assert_eq!(theme[key], standard_manifest()[key]);
         }
         let target = read_json(&root.path().join("theme/targets/default.json"));
