@@ -1,5 +1,5 @@
 [package]
-name = "corona"
+name = "corona-cli"
 version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"

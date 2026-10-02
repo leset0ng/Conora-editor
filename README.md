@@ -33,7 +33,7 @@ corona check --theme my-icons --all-targets --json
 corona build --theme my-icons --all-targets --output ./packs
 ```
 
-After the core and CLI crates are published to crates.io, installation will also be available with `cargo install corona --locked`. They are not published by this repository change.
+For installation from crates.io, use `cargo install corona-cli --locked`. The crate package is `corona-cli`; the installed executable is `corona`. The shared library is published separately as `corona-core`.
 
 Existing packs can be imported with `corona import pack.crpack --into ./theme --firmware firmware.bin --target p67-3.101.043`. `corona plan --theme ./theme --from p67-3.101.043 --target q66-4.100.155` proposes bindings without changing them; `corona preview --theme ./theme --target q66-4.100.155 --verify` previews actual encoded resources and verifies conversion. Explicit target exclusions let one firmware retain icons another firmware cannot use. Native batch operations traverse compressed resources once instead of restarting decompression for every icon.
 

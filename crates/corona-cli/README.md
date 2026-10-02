@@ -11,13 +11,14 @@ cargo install --path crates/corona-cli --locked
 corona --help
 ```
 
-After `corona-core` and `corona` are published to crates.io:
+From crates.io:
 
 ```bash
-cargo install corona --locked
+cargo install corona-cli --locked
+corona --help
 ```
 
-The installed executable is `corona`. These crates are prepared for publication but are not published by this change. Rust 1.88 or newer is required. The existing AstroBox plugin remains a separate WASM build.
+The crate package is `corona-cli`; the installed executable is `corona`. The shared library is `corona-core`. Rust 1.88 or newer is required. The existing AstroBox plugin remains a separate WASM build.
 
 ## One theme, multiple firmwares
 
