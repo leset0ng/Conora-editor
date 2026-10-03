@@ -44,7 +44,7 @@ corona target add band11-B --theme my-icons \
   --firmware /path/to/firmware-B.bin --device another-firmware
 ```
 
-`init` creates empty role/binding maps: it does not guess which resources represent an icon. It also works without `--firmware`; add targets later. `target add` records the SHA-256 of the entire firmware and refuses to overwrite an existing target unless `--force` is given. Replacing a target resets its bindings/overrides; review the new firmware and re-add them deliberately.
+`init` creates empty role/binding maps: it does not guess which resources represent an icon. It also works without `--firmware`; add targets later. `target add` records the SHA-256 of the entire firmware and refuses to overwrite an existing target unless `--force` is given. Replacing a target resets its firmware bindings/overrides but retains its explicit runtime files, mappings and imported application declarations; review the new firmware and re-add firmware bindings deliberately.
 
 Inspect each firmware and extract original reference images:
 
@@ -205,6 +205,44 @@ Builds emit a mapping with source `/data/canopus/manager_icon.bin` and archive d
 
 Reads are bounded (64 MiB per input/template, 1 MiB config). Theme updates are staged and atomically published; inputs/templates/firmware and their symlink/hardlink aliases are protected. Redirected asset directories and symlink theme files are refused. Other project configs cannot be overwritten. Asset publication precedes the config update, so an I/O failure can leave unbound copied assets but never a declaration referencing an incomplete copy.
 
+## Custom runtime files and rules
+
+Use this lane for device paths absent from the firmware inventory. Exact file rules need only a source and input:
+
+```bash
+corona mapping add --theme ./my-icons --target band11-A \
+  --source /data/custom/icon.bin --input ./icon.png
+corona mapping list --theme ./my-icons --target band11-A --json
+corona mapping remove --theme ./my-icons --target band11-A \
+  --source /data/custom/icon.bin
+```
+
+PNG input defaults to lossless, uncompressed LVGL v9 ARGB8888 at its native dimensions with alpha retained, exactly like template-free QuickApp icons. `--template original.bin` opts into a supported LVGL layout and proportional resizing. Non-PNG files are raw; `--raw` explicitly bypasses PNG conversion and copies any file bytes unchanged. Raw files need not be images. Outputs are not certified for any particular runtime consumer.
+
+The archive destination defaults to `custom/<16-hex-source-hash>.bin`; it never becomes an inferred `/resource/` mapping. Set `--destination custom/icon.bin` for an explicit safe archive filename. Omit `--input` while naming an existing destination to add a source alias without copying another asset. Duplicate sources are rejected unless `--force` explicitly updates that rule. Updating an imported supported raw BIN with a PNG defaults to using the original immutable BIN as its template; an explicit template overrides that choice. Commands copy inputs/templates to fresh project-owned paths, preflight conversion and target budgets before atomically updating its config. Removed rules do not delete copied input files; declared but unreferenced runtime files remain in builds until explicitly removed from `runtimeFiles`.
+
+Target config fields (within the existing fingerprinted target) are:
+
+```json
+{
+  "runtimeFiles": {
+    "custom/icon.bin": {"input":"assets/custom/icon.png", "mode":"png"},
+    "custom/config.dat": {"input":"assets/custom/config.dat", "mode":"raw"}
+  },
+  "runtimeMappings": [
+    {"source":"/data/custom/icon.bin", "destination":"custom/icon.bin"},
+    {"source":"/system/custom/icon.bin", "destination":"custom/icon.bin"},
+    {"source":"/data/custom/config.dat", "destination":"custom/config.dat"}
+  ]
+}
+```
+
+Input/template paths are relative to the theme file; rule destinations are archive-relative. `runtimeFiles` reuses the native input option shape (`input`, `mode`, optional `template`, `allowQuantize`, `filter`), but raw bytes bypass native image inspection. Raw mode cannot specify a template. `runtimeQuickappIcons` retains imported `{package,destination}` declarations when their original filenames must be preserved.
+
+Sources are not required to exist in the pinned firmware; normal `bindings` retain their strict inventory validation. Runtime-only CLI projects still select a fingerprinted firmware target. Unmapped runtime files are packaged but never acquire an inferred rule. Directory rules in config/import end both paths with `/` and append the unmatched suffix; exact file exceptions and aliases are supported. The device uses the longest source match, not list order. The convenience `mapping add` command focuses on exact files; list/remove handle imported directory rules. Rule order is retained when serializing.
+
+All lanes share path safety, 256 combined rules, 32 KiB generated TSV, 64 KiB manifest, and 64 MiB uncompressed pack budgets. Runtime reports carry `archivePath`, `origin: "runtime"`, and `runtime:<archivePath>` identities; `runtime_unverified` is advisory, not a missing-firmware error. The CLI never checks whether the runtime actually reads a source.
+
 ## Import an existing pack
 
 ```bash
@@ -215,10 +253,10 @@ corona import recircle.crpack --into ./recircle \
 - The destination must be new. Import stages and validates a complete project before atomically publishing it without replacing an existing directory, including racing empty directories or symlinks. Supported publication platforms are macOS/iOS, Linux/Android and Windows; unsupported no-replace filesystems/platforms fail safely.
 - Import accepts exactly one root `corona.json` or legacy `canora.json`, with identical size, CRC and format checks. Both names in one archive are rejected, even if their contents match. New builds and extracted file lists always use `corona.json`.
 - Metadata and the original archive/manifest bytes are preserved in `source/original.crpack` and `source/corona.json`; the backup archive remains byte-for-byte unchanged, even when its manifest uses the legacy filename. Original resource bytes are in `source/raw/`. `source/import.json` records mappings, diagnostics and unbound files.
-- Bindings are resolved from the actual ordered source/destination mappings, including archive renames; filenames alone are not evidence. Missing firmware resources, ambiguous/order-dependent rules and arbitrary mappings outside `/resource/` fail rather than being guessed. The exact Canopus source and declared/normalized QuickApp icon sources are recognized separately and imported as validated, byte-preserving raw native assets; native-only packs are supported. These icons are not turned into firmware roles or silently dropped. Multiple native consumers may share one original BIN and remain independent declarations. An overlapping ordinary firmware mapping is explicitly rejected rather than discarded. Original archive destinations are normalized on rebuild.
-- Supported images become shared editable PNGs. Unsupported or malformed images remain explicit raw assets, with diagnostics. Unmapped archive files are preserved but not included in builds, and this limitation is reported.
-- **The imported target has raw overrides for decoded PNG roles, preserving the original mapped resource bytes.** To use edited PNG artwork for that target, remove the corresponding override. New targets added afterward have no overrides and use shared PNG conversion. Raw-original warnings are deliberate: byte preservation is not device-format certification.
-- Builds are not lossless copies of arbitrary third-party packages: archive layout/mapping renames are normalized to resource paths; unmapped files, unknown manifest fields and the original target list remain in the preserved source, not necessarily in generated packs. Original mapped replacement bytes are preserved; the ZIP container is not.
+- **Default import preserves** every archive file as a raw `runtimeFiles` asset, original ordered `runtimeMappings`, and original `runtimeQuickappIcons` destinations/declarations. Arbitrary absolute runtime sources and sources absent from firmware are accepted. Aliases, directory rules with exact exceptions, native/ordinary shared destinations and unmapped files remain intact. Filename renames are not normalized, and no source paths are guessed.
+- Raw imported bytes are unchanged on rebuild, including files with no rule. Use `mapping add --force --source ... --input edited.png` to replace an exact-file rule with editable PNG artwork; a supported original BIN provides the default template. Existing imported Canopus/QuickApp sources, including `runtimeQuickappIcons` declarations, can be edited this way without changing their declaration form. `icon set` refuses to create a duplicate shared declaration for a target-owned imported icon and reports the owning targets. Shared destinations cannot be overwritten implicitly; use `--destination` with a fresh archive filename to update only the selected source while retaining other aliases.
+- `--normalize-firmware` explicitly selects the legacy workflow: ordinary `/resource/` rules are resolved into real firmware bindings, supported images become shared PNGs, and the original target has raw overrides preserving mapped bytes. Remove an override to use its edited PNG. This mode rejects missing firmware sources, ambiguous rules, non-resource custom sources and native/ordinary destination overlaps rather than silently changing their semantics; destinations are normalized and unmapped files are omitted from builds.
+- Rebuilds preserve file bytes, ordinary mapping order and application declarations in default mode, not the ZIP container/compression, arbitrary unknown manifest fields or the full original advisory target list. Original evidence remains in `source/`.
 
 ## Read-only adaptation planning
 
@@ -229,7 +267,7 @@ corona plan --theme ./recircle --from p67-3.101.043 --target q66-4.100.155 \
   --compare-images --json
 ```
 
-Planning loads both pinned firmware inventories but **never modifies configs or creates output files**. It returns up to five deterministic candidates per role, source/candidate dimensions, path/name/alias hints, current bindings/exclusions and unmatched roles. Numeric size suffixes alone are not semantic matching tokens. `score` is a lexical ranking, not a calibrated confidence or compatibility guarantee.
+Planning loads both pinned firmware inventories but **never modifies configs or creates output files**. Explicit runtime mappings are reported separately with `automaticAdaptation: false`; they are not guessed from firmware filenames or counted as unmatched firmware roles. It returns up to five deterministic candidates per role, source/candidate dimensions, path/name/alias hints, current bindings/exclusions and unmatched roles. Numeric size suffixes alone are not semantic matching tokens. `score` is a lexical ranking, not a calibrated confidence or compatibility guarantee.
 
 Optional `artworkSimilarity` compares normalized, alpha-premultiplied pixels only for shortlisted candidates. Different stock artwork can still represent the same application. Missing/undecodable artwork and the bounded 64 MiB comparison budget produce warnings without discarding lexical candidates. Review application meaning, dynamic-image backgrounds, one-to-many slots and size variants before manually editing target bindings/exclusions. Planning supports at most 4096 roles per invocation.
 
@@ -242,7 +280,7 @@ corona preview --theme ./recircle --all-targets --output ./previews --force --js
 
 Preview prepares current target packs in memory, then decodes **the actual encoded replacements**, not the source images. It does not publish `.crpack` files or inspect a stale existing `dist/` file. Individual PNGs are at most 2048 pixels per side; paginated contact sheets use 112-pixel tiles, eight columns and at most 256 tiles per page. `preview_index-<target>.json` maps each tile/PNG ID to its role, resource, dimensions and original manifest. No font dependency is needed for raster labels: the adjacent JSON index is authoritative.
 
-`--verify` checks PNG-mode replacements against pinned native metadata/fixed LVGL headers and nearest-resized source pixels. Intrinsic/opted-in lossy conversion reports `samePixels: false` rather than falsely claiming pixel identity. Raw resources have `verification.status: "notApplicable"`; raw nonimages are explicitly skipped. Top-level index `verified` is true only when every replacement has a conversion verification result; `verificationRequested` records the option separately. Verification is not an on-device appearance or dynamic-rendering guarantee.
+`--verify` checks PNG-mode replacements against pinned native metadata/fixed LVGL headers and nearest-resized source pixels. Intrinsic/opted-in lossy conversion reports `samePixels: false` rather than falsely claiming pixel identity. Raw resources have `verification.status: "notApplicable"`; raw nonimages are explicitly skipped. Runtime previews look up their actual `archivePath`, not a guessed firmware path. Runtime PNG verification checks the explicit template or source-dimension ARGB8888 contract and reports `scope: "encoding"`, `deviceCompatibility: "unverified"`. Top-level index `verified` is true only when every replacement has a conversion verification result; `verificationRequested` records the option separately. Verification is not an on-device appearance or dynamic-rendering guarantee.
 
 Inputs/decoded images are bounded, output filenames are collision-checked, and inputs remain protected even with `--force`. All selected targets finish validation/staging before any final preview files are committed. Filesystem commit failures report `outputs` and `partialCommit`, like build.
 
@@ -272,7 +310,7 @@ CRPack v1 has no target-dependent resource branches. These builds intentionally 
 
 `--json` is a global option and can appear before or after a command. It writes one JSON result to stdout with `schemaVersion: 1`, `ok` and `command`. Any human diagnostics use stderr. Help/version remain normal text, even with `--json`.
 
-Check/build results contain `targets`, an array of target reports. Successful builds also contain `outputs`. A target report includes `valid`, `firmwareSha256`, successful `resources`, `errors`, `warnings` and `packBytes`. Diagnostics include a stable `code` and a human-readable `message`, plus `role`, `resource` and `input` when applicable. Native icon report resource identities are `/data/canopus/manager_icon.bin` and `@quickapp-icon/<package>`; archive destinations differ as described above. Useful diagnostic codes include `missing_binding`, `missing_resource`, `duplicate_binding`, `asset_input`, `unsupported_template`, `template_size`, `image_conversion`, `pack_validation`, `raw_unverified` and `lossy_conversion`.
+Check/build results contain `targets`, an array of target reports. Successful builds also contain `outputs`. A target report includes `valid`, `firmwareSha256`, successful `resources`, `errors`, `warnings` and `packBytes`. Diagnostics include a stable `code` and a human-readable `message`, plus `role`, `resource` and `input` when applicable. Native icon report resource identities are `/data/canopus/manager_icon.bin` and `@quickapp-icon/<package>`; archive destinations differ as described above. Runtime resources use `runtime:<archivePath>` with explicit `archivePath` and `origin: "runtime"`; `runtime_asset` is an error and `runtime_unverified` is advisory. Useful diagnostic codes include `missing_binding`, `missing_resource`, `duplicate_binding`, `asset_input`, `unsupported_template`, `template_size`, `image_conversion`, `pack_validation`, `raw_unverified` and `lossy_conversion`.
 
 On failure, top-level `errors` describes the command failure. Validation failures retain the per-target reports so an agent can fix multiple independent issues in one iteration. Successful resources in a failed report do not imply that a pack was emitted.
 

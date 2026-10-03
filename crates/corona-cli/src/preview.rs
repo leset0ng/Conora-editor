@@ -165,25 +165,34 @@ fn target_previews(
     let mut skipped = 0usize;
     // Reports have deterministic role/resource ordering and identify overrides as well.
     for resource in &report.resources {
-        let built = pack
-            .replacements
-            .get(&super::icon::archive_path(&resource.resource))
-            .ok_or_else(|| {
-                Failure::new(
-                    "preview_pack",
-                    format!("built pack omits {}", resource.resource),
-                )
-            })?;
+        let archive_path = resource
+            .archive_path
+            .clone()
+            .unwrap_or_else(|| super::icon::archive_path(&resource.resource));
+        let built = pack.replacements.get(&archive_path).ok_or_else(|| {
+            Failure::new(
+                "preview_pack",
+                format!("built pack omits {}", resource.resource),
+            )
+        })?;
         // Resource identities may contain opaque QuickApp packages (including
         // path separators); only the hashed ID belongs in preview filenames.
         let resource_id = resource_id(&resource.role, &resource.resource);
         let mut entry = json!({"id": resource_id, "role": resource.role, "resource": resource.resource,
+            "archivePath":archive_path,"origin":resource.origin,
             "mode": resource.mode, "lossy": resource.lossy});
+        if resource.origin.as_deref() == Some("runtime") {
+            entry["deviceCompatibility"] = json!("unverified");
+        }
         if let Some(value) = verification.get(&resource.resource) {
             entry["verification"] = value.clone();
         }
+        let opaque_runtime = resource.origin.as_deref() == Some("runtime")
+            && resource.mode == project::AssetMode::Raw;
         if lvgl::inspect_image(built).is_none() {
-            if built.starts_with(b"\x89PNG\r\n\x1a\n") || built.starts_with(b"\xff\xd8\xff") {
+            if !opaque_runtime
+                && (built.starts_with(b"\x89PNG\r\n\x1a\n") || built.starts_with(b"\xff\xd8\xff"))
+            {
                 return Err(Failure::new(
                     "preview_decode",
                     format!("invalid or oversized raster image: {}", resource.resource),
@@ -201,8 +210,26 @@ fn target_previews(
             entries.push(entry);
             continue;
         }
-        let (info, image) = decode_bounded(built)
-            .map_err(|e| Failure::new("preview_decode", format!("{}: {e}", resource.resource)))?;
+        let (info, image) = match decode_bounded(built) {
+            Ok(image) => image,
+            Err(error) if opaque_runtime => {
+                // A raw runtime file is allowed to resemble an image header without
+                // being one. Optional bounded preview must not invalidate its pack.
+                entry["status"] = json!("skipped");
+                entry["reason"] = json!(format!(
+                    "raw runtime file cannot be previewed as an image: {error}"
+                ));
+                skipped += 1;
+                entries.push(entry);
+                continue;
+            }
+            Err(error) => {
+                return Err(Failure::new(
+                    "preview_decode",
+                    format!("{}: {error}", resource.resource),
+                ));
+            }
+        };
         // Individual files are also bounded; index retains actual built dimensions.
         let preview = fit(&image, 2048);
         let filename = format!("preview-{id}-{resource_id}.png");
@@ -393,6 +420,27 @@ fn verify_replacements(
             .ok_or_else(|| Failure::new("preview_verify", "replacement has no resource summary"))?;
         if summary.mode == project::AssetMode::Raw {
             values.insert(path.clone(), json!({"status": "notApplicable", "reason": "raw replacements have no PNG conversion contract"}));
+        } else if summary.origin.as_deref() == Some("runtime") {
+            let archive_path = summary.archive_path.as_deref().ok_or_else(|| {
+                Failure::new("preview_verify", "runtime replacement has no archive path")
+            })?;
+            let asset = target.runtime_files.get(archive_path).ok_or_else(|| {
+                Failure::new("preview_verify", "runtime replacement has no asset")
+            })?;
+            let built = replacements
+                .get(archive_path)
+                .ok_or_else(|| Failure::new("preview_verify", "runtime replacement missing"))?;
+            let mut proof = if let Some(template) = &asset.template {
+                let template =
+                    project::read_limited(&theme.root.join(template), project::MAX_TEMPLATE_BYTES)?;
+                verify_image(summary, &template, built)
+            } else {
+                verify_template_free_icon(summary, built)
+            }
+            .map_err(|e| Failure::new("preview_verify", format!("{archive_path}: {e}")))?;
+            proof["scope"] = json!("encoding");
+            proof["deviceCompatibility"] = json!("unverified");
+            values.insert(path.clone(), proof);
         } else if let Some(asset) = super::icon::asset(theme, &target, path)? {
             let original = if let Some(template) = asset["template"].as_str() {
                 Some(project::read_limited(
@@ -525,6 +573,8 @@ mod tests {
         let summary = project::ResourceSummary {
             role: "quickapp:org.own".into(),
             resource: corona_core::app_icons::source("org.own"),
+            archive_path: None,
+            origin: None,
             input,
             mode: project::AssetMode::Png,
             size_bytes: 36,

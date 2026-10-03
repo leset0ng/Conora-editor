@@ -5,5 +5,6 @@ pub mod crpack;
 pub mod firmware;
 pub mod lvgl;
 pub mod project;
+pub mod runtime;
 
 pub use lvgl::ResizeFilter;

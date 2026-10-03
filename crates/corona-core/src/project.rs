@@ -13,6 +13,7 @@ pub use crate::app_icons::AppIconAsset;
 use crate::crpack::{self, Mapping, PackOptions, QuickappIcon};
 use crate::firmware::FirmwareIndex;
 use crate::lvgl;
+use crate::runtime::{self, RuntimeAsset};
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 /// Maximum native CLI firmware input size; independent of the CRPack output budget.
@@ -94,6 +95,12 @@ impl Asset {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Target {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime_files: BTreeMap<String, RuntimeAsset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_mappings: Vec<Mapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_quickapp_icons: Vec<QuickappIcon>,
     #[serde(default = "schema_version")]
     pub schema_version: u32,
     pub firmware: PathBuf,
@@ -156,6 +163,11 @@ pub struct Diagnostic {
 pub struct ResourceSummary {
     pub role: String,
     pub resource: String,
+    /// Archive file used for preview, independent of the runtime source identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     pub input: PathBuf,
     pub mode: AssetMode,
     pub size_bytes: usize,
@@ -344,6 +356,11 @@ pub fn target_ids(project: &ThemeProject) -> Result<Vec<String>, String> {
 pub fn load_target(project: &ThemeProject, id: &str) -> Result<Target, String> {
     validate_target_id(id)?;
     let target: Target = read_config(&project.root.join("targets").join(format!("{id}.json")))?;
+    validate_target_config(project, &target)?;
+    Ok(target)
+}
+
+fn validate_target_config(project: &ThemeProject, target: &Target) -> Result<(), String> {
     if target.schema_version != 1 {
         return Err(format!(
             "unsupported target schemaVersion: {}",
@@ -369,8 +386,7 @@ pub fn load_target(project: &ThemeProject, id: &str) -> Result<Target, String> {
         project.theme.author.as_deref(),
         project.theme.description.as_deref(),
         target.device.as_deref(),
-    )?;
-    Ok(target)
+    )
 }
 
 pub fn target_firmware_path(project: &ThemeProject, _id: &str, target: &Target) -> PathBuf {
@@ -410,9 +426,33 @@ pub fn prepare_target(project: &ThemeProject, id: &str) -> PreparedTarget {
 pub fn prepare_target_with_progress(
     project: &ThemeProject,
     id: &str,
-    mut progress: impl FnMut(&str),
+    progress: impl FnMut(&str),
 ) -> PreparedTarget {
-    let mut report = TargetReport {
+    match load_target(project, id) {
+        Ok(target) => prepare_loaded_target(project, id, &target, progress),
+        Err(error) => target_config_error(id, error),
+    }
+}
+
+/// Validate and prepare an in-memory target without publishing assets or config.
+/// Input/template paths may point at external temporary files; firmware paths
+/// retain the same resolution and fingerprint requirements as saved targets.
+pub fn prepare_target_config(project: &ThemeProject, id: &str, target: &Target) -> PreparedTarget {
+    if let Err(error) = validate_target_id(id).and_then(|_| validate_target_config(project, target))
+    {
+        return target_config_error(id, error);
+    }
+    prepare_loaded_target(project, id, target, |_| {})
+}
+
+fn target_config_error(id: &str, error: String) -> PreparedTarget {
+    let mut report = empty_target_report(id);
+    report.errors.push(Diagnostic::new("target_config", error));
+    PreparedTarget { report, pack: None }
+}
+
+fn empty_target_report(id: &str) -> TargetReport {
+    TargetReport {
         schema_version: 1,
         target: id.into(),
         firmware_sha256: None,
@@ -422,16 +462,18 @@ pub fn prepare_target_with_progress(
         errors: Vec::new(),
         warnings: Vec::new(),
         pack_bytes: 0,
-    };
-    let target = match load_target(project, id) {
-        Ok(target) => target,
-        Err(error) => {
-            report.errors.push(Diagnostic::new("target_config", error));
-            return PreparedTarget { report, pack: None };
-        }
-    };
+    }
+}
+
+fn prepare_loaded_target(
+    project: &ThemeProject,
+    id: &str,
+    target: &Target,
+    mut progress: impl FnMut(&str),
+) -> PreparedTarget {
+    let mut report = empty_target_report(id);
     report.excluded = target.excluded.clone();
-    let firmware_path = target_firmware_path(project, id, &target);
+    let firmware_path = target_firmware_path(project, id, target);
     progress(&format!("Loading firmware for target {id}"));
     let firmware = match load_firmware(&firmware_path, Some(&target.firmware_sha256)) {
         Ok(firmware) => firmware,
@@ -707,6 +749,32 @@ pub fn prepare_target_with_progress(
             report.errors.push(Diagnostic::new("resource_read", error));
         }
     }
+    // With runtime authoring, grouped firmware rules could accidentally map
+    // unmapped runtime siblings or duplicate preserved directory sources. Exact
+    // firmware exceptions come first; runtime rules retain their authored order.
+    // Legacy firmware-only projects keep their original grouped inference.
+    let has_runtime = !target.runtime_files.is_empty()
+        || !target.runtime_mappings.is_empty()
+        || !target.runtime_quickapp_icons.is_empty();
+    let mut mappings = if has_runtime {
+        replacements
+            .keys()
+            .map(|path| Mapping {
+                source: format!("/resource/{path}"),
+                destination: path.clone(),
+            })
+            .collect()
+    } else {
+        match crpack::firmware_mappings(replacements.keys()) {
+            Ok(mappings) => mappings,
+            Err(error) => {
+                report
+                    .errors
+                    .push(Diagnostic::new("pack_validation", error));
+                Vec::new()
+            }
+        }
+    };
     let mut explicit_mappings = Vec::new();
     let mut quickapp_icons = Vec::new();
     for package in target.quickapp_icons.keys() {
@@ -757,6 +825,24 @@ pub fn prepare_target_with_progress(
             &mut quickapp_icons,
         );
     }
+    mappings.extend(explicit_mappings);
+    mappings.extend_from_slice(&target.runtime_mappings);
+    quickapp_icons.extend_from_slice(&target.runtime_quickapp_icons);
+    for (destination, asset) in &target.runtime_files {
+        progress(&format!("Converting runtime file {destination}"));
+        prepare_runtime_file(
+            project,
+            destination,
+            asset,
+            &target.runtime_mappings,
+            &target.runtime_quickapp_icons,
+            &mut report,
+            &mut replacements,
+            &mut total_bytes,
+            &mut source_bytes,
+            &mut template_bytes,
+        );
+    }
     // Reports remain deterministic by semantic role/path, independent of ROMFS layout.
     report
         .resources
@@ -764,10 +850,11 @@ pub fn prepare_target_with_progress(
     if project.theme.icons.is_empty()
         && project.theme.canopus_icon.is_none()
         && project.theme.quickapp_icons.is_empty()
+        && target.runtime_files.is_empty()
     {
         report.errors.push(Diagnostic::new(
             "empty_theme",
-            "declare firmware source assets or application icons before building",
+            "declare firmware source assets, application icons or runtime files before building",
         ));
     }
     let pack = if report.errors.is_empty() {
@@ -781,7 +868,7 @@ pub fn prepare_target_with_progress(
             target: target.device.as_deref(),
             replacements: &replacements,
         };
-        match crpack::build_crpack_with_icons(&options, &explicit_mappings, &quickapp_icons) {
+        match crpack::build_crpack_with_mappings(&options, &mappings, &quickapp_icons) {
             Ok(bytes) => {
                 report.valid = true;
                 report.pack_bytes = bytes.len();
@@ -910,6 +997,8 @@ fn prepare_app_icon(
     report.resources.push(ResourceSummary {
         role,
         resource: resource.clone(),
+        archive_path: Some(destination.clone()),
+        origin: None,
         input: input_path,
         mode: asset.mode,
         size_bytes: encoded.bytes.len(),
@@ -930,6 +1019,146 @@ fn prepare_app_icon(
             source: resource,
             destination,
         }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_runtime_file(
+    project: &ThemeProject,
+    destination: &str,
+    asset: &RuntimeAsset,
+    mappings: &[Mapping],
+    icons: &[QuickappIcon],
+    report: &mut TargetReport,
+    replacements: &mut BTreeMap<String, Vec<u8>>,
+    total_bytes: &mut usize,
+    source_bytes: &mut usize,
+    template_bytes: &mut usize,
+) {
+    // Preserve the first ordered rule's source identity in diagnostics. Summary
+    // identities use the archive path so aliases and shared files are previewable.
+    let resource = mappings
+        .iter()
+        .find_map(|mapping| {
+            if mapping.destination.ends_with('/') {
+                destination
+                    .strip_prefix(&mapping.destination)
+                    .map(|suffix| format!("{}{suffix}", mapping.source))
+            } else if mapping.destination == destination {
+                Some(mapping.source.clone())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            icons
+                .iter()
+                .find(|icon| icon.destination == destination)
+                .map(|icon| app_icons::source(&icon.package))
+        })
+        .unwrap_or_else(|| destination.to_owned());
+    let role = format!("runtime:{destination}");
+    let input_path = project.root.join(&asset.input);
+    let result = (|| {
+        crpack::validate_relative_path(destination)?;
+        if asset.input.as_os_str().is_empty() {
+            return Err("runtime input cannot be empty".into());
+        }
+        if asset.mode == AssetMode::Raw && asset.template.is_some() {
+            return Err("raw runtime files must not specify a conversion template".into());
+        }
+        let input = read_limited(&input_path, MAX_ASSET_BYTES.saturating_sub(*source_bytes))?;
+        *source_bytes += input.len();
+        let template = if let Some(path) = &asset.template {
+            if path.as_os_str().is_empty() {
+                return Err("runtime template path cannot be empty".into());
+            }
+            let bytes = read_limited(
+                &project.root.join(path),
+                MAX_TEMPLATE_BYTES.saturating_sub(*template_bytes),
+            )?;
+            *template_bytes += bytes.len();
+            Some(bytes)
+        } else {
+            None
+        };
+        let encoded = runtime::encode(
+            &input,
+            template.as_deref(),
+            asset.mode == AssetMode::Raw,
+            asset.allow_quantize,
+            asset.filter,
+        )?;
+        if let Some(existing) = replacements.get(destination) {
+            if existing != &encoded.bytes {
+                return Err(format!(
+                    "runtime destination conflicts with different replacement bytes: {destination}"
+                ));
+            }
+        } else if encoded.bytes.len() > MAX_PACK_BYTES.saturating_sub(*total_bytes) {
+            return Err("replacement files exceed the 64 MiB CRPack limit".into());
+        }
+        Ok(encoded)
+    })();
+    let encoded = match result {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            report
+                .errors
+                .push(Diagnostic::new("runtime_asset", error).at(
+                    &role,
+                    Some(&resource),
+                    Some(&input_path),
+                ));
+            return;
+        }
+    };
+    report.warnings.push(Diagnostic::new("runtime_unverified",
+        "runtime source existence, device compatibility and receiver behavior are not verified against the pinned firmware")
+        .at(&role, Some(&resource), Some(&input_path)));
+    if asset.mode == AssetMode::Raw {
+        report.warnings.push(
+            Diagnostic::new(
+                "raw_unverified",
+                "raw runtime file is copied without inspecting or certifying its format",
+            )
+            .at(&role, Some(&resource), Some(&input_path)),
+        );
+    }
+    if encoded.lossy_quantization {
+        report.warnings.push(
+            Diagnostic::new(
+                "lossy_conversion",
+                "runtime conversion reduced color precision or transparency",
+            )
+            .at(&role, Some(&resource), Some(&input_path)),
+        );
+    }
+    // Never inspect raw bytes as images. PNG conversion supplies image metadata.
+    let info = if asset.mode == AssetMode::Png {
+        lvgl::inspect_image(&encoded.bytes)
+    } else {
+        None
+    };
+    report.resources.push(ResourceSummary {
+        // Archive-qualified identity avoids collisions with firmware summaries,
+        // even when an identical runtime asset shares a firmware destination.
+        resource: role.clone(),
+        role,
+        archive_path: Some(destination.into()),
+        origin: Some("runtime".into()),
+        input: input_path,
+        mode: asset.mode,
+        size_bytes: encoded.bytes.len(),
+        format: info.map(|info| info.format.display_name().into()),
+        width: info.map(|info| info.width),
+        height: info.map(|info| info.height),
+        lossy: encoded.lossy_quantization,
+        filter: asset.filter,
+    });
+    if !replacements.contains_key(destination) {
+        *total_bytes += encoded.bytes.len();
+        replacements.insert(destination.into(), encoded.bytes);
     }
 }
 
@@ -977,6 +1206,8 @@ fn record_replacement(
     report.resources.push(ResourceSummary {
         role: role.into(),
         resource: file.path.clone(),
+        archive_path: Some(file.path.clone()),
+        origin: None,
         input: input.to_path_buf(),
         mode,
         size_bytes: bytes.len(),

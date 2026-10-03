@@ -37,6 +37,7 @@ fn import(root: &Path, into: &str) -> Value {
             &[
                 "import",
                 "input.crpack",
+                "--normalize-firmware",
                 "--into",
                 into,
                 "--firmware",
@@ -55,6 +56,7 @@ fn rejected(root: &Path) -> Value {
             &[
                 "import",
                 "input.crpack",
+                "--normalize-firmware",
                 "--into",
                 "theme",
                 "--firmware",
@@ -202,7 +204,14 @@ fn fictional_two_image_and_all_forty_image_roundtrip_preserve_originals() {
             parsed.manifest_bytes
         );
         let theme = read_json(&root.path().join("theme/theme.json"));
-        for key in ["themeId", "name", "version", "versionCode", "author", "description"] {
+        for key in [
+            "themeId",
+            "name",
+            "version",
+            "versionCode",
+            "author",
+            "description",
+        ] {
             assert_eq!(theme[key], standard_manifest()[key]);
         }
         let target = read_json(&root.path().join("theme/targets/default.json"));
@@ -704,6 +713,7 @@ fn import_progress_is_throttled_and_does_not_corrupt_json_stdout() {
         &[
             "import",
             "input.crpack",
+            "--normalize-firmware",
             "--into",
             "theme",
             "--firmware",
@@ -953,4 +963,359 @@ fn shared_opaque_quickapp_keys_with_trailing_slash_import_build_and_preview() {
         assert_eq!(Path::new(filename).components().count(), 1);
         assert!(root.path().join("theme/previews").join(filename).is_file());
     }
+}
+
+fn preserving_import(root: &Path) -> Value {
+    result(
+        run(
+            root,
+            &[
+                "import",
+                "input.crpack",
+                "--into",
+                "theme",
+                "--firmware",
+                "watch.bin",
+                "--json",
+            ],
+        ),
+        true,
+    )
+}
+
+fn rebuilt_pack(root: &Path) -> crpack::UnpackedCrpack {
+    let report = result(
+        run(
+            root,
+            &["build", "--theme", "theme", "--target", "default", "--json"],
+        ),
+        true,
+    );
+    crpack::parse_crpack(&fs::read(root.join(report["outputs"][0].as_str().unwrap())).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn default_import_preserves_runtime_aliases_directories_exceptions_and_unmapped_bytes() {
+    let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+    let files = BTreeMap::from([
+        (
+            "renamed/shared.dat".into(),
+            b"arbitrary runtime bytes".to_vec(),
+        ),
+        ("tree/a.dat".into(), vec![0, 1, 2, 255]),
+        ("unused/sibling.bin".into(), vec![3, 4]),
+    ]);
+    let rules = json!([
+        {"source":"/system/custom/", "destination":"tree/"},
+        {"source":"/data/custom/config.dat", "destination":"renamed/shared.dat"},
+        {"source":"/system/custom/a.dat", "destination":"renamed/shared.dat"},
+        {"source":"/resource/not-in-firmware.dat", "destination":"renamed/shared.dat"},
+    ]);
+    let root = fixture(&firmware_files, &files, &manifest(rules.clone()));
+    let report = preserving_import(root.path());
+    assert_eq!(report["mode"], "preserve");
+    assert_eq!(report["mappings"], rules);
+    assert_eq!(report["unmapped"], json!(["unused/sibling.bin"]));
+    let target = read_json(&root.path().join("theme/targets/default.json"));
+    assert_eq!(target["runtimeMappings"], rules);
+    assert_eq!(target["bindings"], json!({}));
+    assert_eq!(
+        target["runtimeFiles"].as_object().unwrap().len(),
+        files.len()
+    );
+    let rebuilt = rebuilt_pack(root.path());
+    assert_eq!(rebuilt.replacements, files);
+    assert_eq!(serde_json::to_value(rebuilt.mappings).unwrap(), rules);
+    result(
+        run(
+            root.path(),
+            &[
+                "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+            ],
+        ),
+        true,
+    );
+    let index = read_json(
+        &root
+            .path()
+            .join("theme/previews/preview_index-default.json"),
+    );
+    assert_eq!(index["verified"], false);
+    for resource in index["resources"].as_array().unwrap() {
+        assert_eq!(resource["deviceCompatibility"], "unverified");
+        assert_eq!(resource["verification"]["status"], "notApplicable");
+    }
+}
+
+#[test]
+fn default_import_preserves_original_native_destinations_declarations_and_shared_files() {
+    let image = template(2, 0x10);
+    let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), image.clone())]);
+    let files = BTreeMap::from([("original/shared.bin".into(), image)]);
+    let mut metadata = manifest(json!([
+        {"source":"/data/canopus/manager_icon.bin", "destination":"original/shared.bin"},
+        {"source":"/data/custom/icon.bin", "destination":"original/shared.bin"},
+        {"source":"@quickapp-icon/a/opaque/", "destination":"original/shared.bin"},
+    ]));
+    metadata["quickappIcons"] = json!([
+        {"package":" 快应用 ", "destination":"original/shared.bin"},
+        {"package":"", "destination":"original/shared.bin"},
+    ]);
+    let root = fixture(&firmware_files, &files, &metadata);
+    preserving_import(root.path());
+    let rebuilt = rebuilt_pack(root.path());
+    assert_eq!(rebuilt.replacements, files);
+    assert_eq!(
+        serde_json::to_value(rebuilt.mappings).unwrap(),
+        metadata["mappings"]
+    );
+    assert_eq!(
+        serde_json::to_value(rebuilt.quickapp_icons).unwrap(),
+        metadata["quickappIcons"]
+    );
+    result(
+        run(
+            root.path(),
+            &[
+                "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+            ],
+        ),
+        true,
+    );
+}
+
+#[test]
+fn default_import_keeps_unmapped_only_packs_without_inventing_resource_rules() {
+    let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+    let files = BTreeMap::from([("unknown/file.dat".into(), b"unmapped".to_vec())]);
+    let root = fixture(&firmware_files, &files, &manifest(json!([])));
+    preserving_import(root.path());
+    let rebuilt = rebuilt_pack(root.path());
+    assert!(rebuilt.mappings.is_empty());
+    assert_eq!(rebuilt.replacements, files);
+}
+
+#[test]
+fn runtime_png_preview_verifies_default_and_original_template_by_actual_archive_path() {
+    for has_template in [false, true] {
+        let original = if has_template {
+            template(2, 0x10)
+        } else {
+            b"opaque bytes".to_vec()
+        };
+        let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+        let files = BTreeMap::from([("renamed/icon.bin".into(), original)]);
+        let metadata = manifest(json!([
+            {"source":"/data/custom/icon.bin", "destination":"renamed/icon.bin"}
+        ]));
+        let root = fixture(&firmware_files, &files, &metadata);
+        preserving_import(root.path());
+        let (width, height) = if has_template { (4, 4) } else { (3, 2) };
+        image::RgbaImage::from_pixel(width, height, image::Rgba([11, 22, 33, 44]))
+            .save(root.path().join("edited.png"))
+            .unwrap();
+        result(
+            run(
+                root.path(),
+                &[
+                    "mapping",
+                    "add",
+                    "--theme",
+                    "theme",
+                    "--target",
+                    "default",
+                    "--source",
+                    "/data/custom/icon.bin",
+                    "--input",
+                    "edited.png",
+                    "--force",
+                    "--json",
+                ],
+            ),
+            true,
+        );
+        result(
+            run(
+                root.path(),
+                &[
+                    "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+                ],
+            ),
+            true,
+        );
+        let index = read_json(
+            &root
+                .path()
+                .join("theme/previews/preview_index-default.json"),
+        );
+        assert_eq!(index["verified"], true);
+        let resource = &index["resources"][0];
+        assert_eq!(resource["archivePath"], "renamed/icon.bin");
+        assert_eq!(resource["origin"], "runtime");
+        assert_eq!(resource["deviceCompatibility"], "unverified");
+        assert_eq!(resource["verification"]["scope"], "encoding");
+        assert_eq!(resource["verification"]["status"], "verified");
+        assert_eq!(resource["verification"]["samePixels"], true);
+        if !has_template {
+            assert_eq!(
+                resource["verification"]["contract"],
+                "sourceDimensionsArgb8888"
+            );
+        }
+        let rebuilt = rebuilt_pack(root.path());
+        let (_, pixels) = lvgl::decode_to_rgba(&rebuilt.replacements["renamed/icon.bin"]).unwrap();
+        let expected = if has_template { (2, 2) } else { (3, 2) };
+        assert_eq!(pixels.dimensions(), expected);
+        assert!(pixels.pixels().all(|pixel| pixel.0 == [11, 22, 33, 44]));
+    }
+}
+
+#[test]
+fn shared_native_set_refuses_imported_runtime_ownership_without_mutation() {
+    for quickapp in [false, true] {
+        let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+        let files = BTreeMap::from([("original/icon.bin".into(), template(2, 0x10))]);
+        let mut metadata = manifest(if quickapp {
+            json!([])
+        } else {
+            json!([
+                {"source":"/data/canopus/manager_icon.bin","destination":"original/icon.bin"}
+            ])
+        });
+        if quickapp {
+            metadata["quickappIcons"] = json!([
+                {"package":"example.app","destination":"original/icon.bin"}
+            ]);
+        }
+        let root = fixture(&firmware_files, &files, &metadata);
+        preserving_import(root.path());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 4]))
+            .save(root.path().join("edited.png"))
+            .unwrap();
+        let theme_path = root.path().join("theme/theme.json");
+        let before = fs::read(&theme_path).unwrap();
+        let selector = if quickapp {
+            vec!["--package", "example.app"]
+        } else {
+            vec!["--canopus"]
+        };
+        let mut args = vec!["icon", "set", "--theme", "theme", "edited.png", "--json"];
+        args.extend(selector);
+        let failure = result(run(root.path(), &args), false);
+        assert_eq!(failure["errors"][0]["code"], "runtime_owned_icon");
+        assert_eq!(failure["runtimeOwners"][0]["target"], "default");
+        assert_eq!(fs::read(theme_path).unwrap(), before);
+        assert!(!root.path().join("theme/assets/native-icons").exists());
+    }
+}
+
+#[test]
+fn shared_native_set_refuses_retained_runtime_destination_after_rule_removal() {
+    for quickapp in [false, true] {
+        let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+        let destination = if quickapp {
+            corona_core::app_icons::destination("example.app")
+        } else {
+            corona_core::app_icons::CANOPUS_DESTINATION.to_owned()
+        };
+        let source = if quickapp {
+            corona_core::app_icons::source("example.app")
+        } else {
+            corona_core::app_icons::CANOPUS_SOURCE.to_owned()
+        };
+        let files = BTreeMap::from([(destination.clone(), template(2, 0x10))]);
+        let mut metadata = manifest(if quickapp {
+            json!([])
+        } else {
+            json!([
+                {"source":source,"destination":destination}
+            ])
+        });
+        if quickapp {
+            metadata["quickappIcons"] = json!([
+                {"package":"example.app","destination":destination}
+            ]);
+        }
+        let root = fixture(&firmware_files, &files, &metadata);
+        preserving_import(root.path());
+        result(
+            run(
+                root.path(),
+                &[
+                    "mapping", "remove", "--theme", "theme", "--target", "default", "--source",
+                    &source, "--json",
+                ],
+            ),
+            true,
+        );
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 30, 40, 50]))
+            .save(root.path().join("edited.png"))
+            .unwrap();
+        let theme_path = root.path().join("theme/theme.json");
+        let before = fs::read(&theme_path).unwrap();
+        let mut args = vec!["icon", "set", "--theme", "theme", "edited.png", "--json"];
+        args.extend(if quickapp {
+            vec!["--package", "example.app"]
+        } else {
+            vec!["--canopus"]
+        });
+        let failure = result(run(root.path(), &args), false);
+        assert_eq!(failure["errors"][0]["code"], "runtime_owned_icon");
+        assert_eq!(failure["runtimeOwners"][0]["sourceMapped"], false);
+        assert_eq!(failure["runtimeOwners"][0]["destinationDeclared"], true);
+        assert_eq!(fs::read(theme_path).unwrap(), before);
+        assert!(!root.path().join("theme/assets/native-icons").exists());
+        assert_eq!(rebuilt_pack(root.path()).replacements, files);
+    }
+}
+
+#[test]
+fn opaque_runtime_image_lookalikes_are_skipped_without_aborting_other_previews() {
+    let firmware_files = BTreeMap::from([("app/icons/stock.bin".into(), template(2, 0x10))]);
+    let mut rle = template(2, 0x10);
+    rle.truncate(12);
+    rle[2..4].copy_from_slice(&8u16.to_le_bytes());
+    rle.extend_from_slice(&0u32.to_le_bytes());
+    rle.extend_from_slice(&2u32.to_le_bytes());
+    rle.extend_from_slice(&u32::MAX.to_le_bytes());
+    rle.extend_from_slice(&[16, 0]);
+    let files = BTreeMap::from([
+        ("raw/png.dat".into(), b"\x89PNG\r\n\x1a\nopaque".to_vec()),
+        ("raw/rle.dat".into(), rle),
+        ("raw/valid.bin".into(), template(2, 0x10)),
+    ]);
+    let root = fixture(
+        &firmware_files,
+        &files,
+        &manifest(json!([
+            {"source":"/data/runtime/","destination":"raw/"}
+        ])),
+    );
+    preserving_import(root.path());
+    let result = result(
+        run(
+            root.path(),
+            &[
+                "preview", "--theme", "theme", "--target", "default", "--verify", "--json",
+            ],
+        ),
+        true,
+    );
+    assert_eq!(result["targets"][0]["preview"]["images"], 1);
+    assert_eq!(result["targets"][0]["preview"]["skipped"], 2);
+    let index = read_json(
+        &root
+            .path()
+            .join("theme/previews/preview_index-default.json"),
+    );
+    let entries = index["resources"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["status"] == "skipped")
+            .count(),
+        2
+    );
+    assert_eq!(rebuilt_pack(root.path()).replacements, files);
 }

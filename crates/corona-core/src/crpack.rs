@@ -65,7 +65,8 @@ pub struct PackOptions<'a> {
     pub replacements: &'a BTreeMap<String, Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mapping {
     pub source: String,
     pub destination: String,
@@ -787,7 +788,8 @@ fn validate_archive_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_absolute_source(path: &str) -> Result<(), String> {
+/// Validate a protocol mapping source (absolute file/directory or QuickApp key).
+pub fn validate_absolute_source(path: &str) -> Result<(), String> {
     // This is the serialized source budget, including a semantic key's prefix.
     if path.len() >= MAX_PATH_BYTES {
         return Err(format!("mapping source exceeds 255 UTF-8 bytes: {path:?}"));
@@ -815,7 +817,8 @@ fn validate_absolute_source(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_relative_destination(path: &str) -> Result<(), String> {
+/// Validate a protocol destination, including directory mappings ending in '/'.
+pub fn validate_relative_destination(path: &str) -> Result<(), String> {
     if path.is_empty() || path.starts_with('/') || path.len() >= MAX_PATH_BYTES {
         return Err(format!("unsafe CRPack destination: {path:?}"));
     }

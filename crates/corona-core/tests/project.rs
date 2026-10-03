@@ -279,6 +279,483 @@ fn target(root: &Path, id: &str, directory: &str, image: &[u8], copies: usize) {
     );
 }
 
+fn runtime_project(files: Value, mappings: Value) -> TempDir {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    write_json(
+        &directory.path().join("theme.json"),
+        &json!({"themeId":"dark", "name":"Runtime"}),
+    );
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["bindings"] = json!({});
+    config["runtimeFiles"] = files;
+    config["runtimeMappings"] = mappings;
+    write_json(&path, &config);
+    directory
+}
+
+#[test]
+fn runtime_only_build_preserves_nonexistent_sources_aliases_overlaps_and_unmapped_files() {
+    let rules = json!([
+        {"source":"/data/absent/tree/", "destination":"custom/tree/"},
+        {"source":"/data/absent/tree/icon.bin", "destination":"custom/tree/icon.bin"},
+        {"source":"/elsewhere/alias.bin", "destination":"custom/tree/icon.bin"}
+    ]);
+    let directory = runtime_project(
+        json!({
+            "custom/tree/icon.bin":{"input":"assets/icon.png"},
+            "unused.bin":{"input":"assets/raw.dat", "mode":"raw"}
+        }),
+        rules.clone(),
+    );
+    let raw = b"arbitrary\0\xff bytes, not an image";
+    fs::write(directory.path().join("assets/raw.dat"), raw).unwrap();
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(&pack.mappings).unwrap(), rules);
+    assert_eq!(pack.replacements["unused.bin"], raw);
+    assert_eq!(pack.replacements.len(), 2);
+    let png_report = built
+        .report
+        .resources
+        .iter()
+        .find(|r| r.archive_path.as_deref() == Some("custom/tree/icon.bin"))
+        .unwrap();
+    assert_eq!(png_report.resource, "runtime:custom/tree/icon.bin");
+    assert!(
+        built
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "runtime_unverified"
+                && warning.resource.as_deref() == Some("/data/absent/tree/icon.bin"))
+    );
+    assert_eq!(png_report.origin.as_deref(), Some("runtime"));
+    assert_eq!((png_report.width, png_report.height), (Some(4), Some(4)));
+    let raw_report = built
+        .report
+        .resources
+        .iter()
+        .find(|r| r.resource == "runtime:unused.bin")
+        .unwrap();
+    assert!(raw_report.format.is_none());
+    assert_eq!(
+        built
+            .report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "runtime_unverified")
+            .count(),
+        2
+    );
+    assert_eq!(
+        built
+            .report
+            .warnings
+            .iter()
+            .filter(|w| w.code == "raw_unverified")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn runtime_import_preserves_quickapp_custom_shared_destinations() {
+    let directory = runtime_project(
+        json!({
+            "custom/shared.bin":{"input":"assets/raw.dat", "mode":"raw"},
+            "unused.bin":{"input":"assets/raw.dat", "mode":"raw"}
+        }),
+        json!([{"source":"/data/canopus/manager_icon.bin", "destination":"custom/shared.bin"}]),
+    );
+    fs::write(
+        directory.path().join("assets/raw.dat"),
+        b"opaque imported BIN",
+    )
+    .unwrap();
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let declarations = json!([
+        {"package":"ng.lst.corona", "destination":"custom/shared.bin"},
+        {"package":"other.package", "destination":"custom/shared.bin"}
+    ]);
+    config["runtimeQuickappIcons"] = declarations.clone();
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(pack.quickapp_icons).unwrap(),
+        declarations
+    );
+    assert_eq!(pack.mappings.len(), 1);
+    assert_eq!(pack.mappings[0].destination, "custom/shared.bin");
+    assert!(pack.replacements.contains_key("unused.bin"));
+}
+
+#[test]
+fn runtime_files_never_add_inferred_firmware_groups_and_rules_keep_order() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["runtimeFiles"] = json!({"custom/icon.bin":{"input":"assets/icon.png"}, "orphan.bin":{"input":"assets/icon.png"}});
+    config["runtimeMappings"] = json!([
+        {"source":"/z/icon.bin", "destination":"custom/icon.bin"},
+        {"source":"/a/icon.bin", "destination":"custom/icon.bin"}
+    ]);
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(
+        pack.mappings
+            .iter()
+            .map(|m| m.source.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/resource/app/icons/test.bin", "/z/icon.bin", "/a/icon.bin"]
+    );
+}
+
+#[test]
+fn unmapped_runtime_sibling_of_firmware_file_stays_unmapped() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["runtimeFiles"] = json!({"app/icons/unmapped.bin":{"input":"assets/icon.png"}});
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(
+        pack.mappings,
+        vec![corona_core::crpack::Mapping {
+            source: "/resource/app/icons/test.bin".into(),
+            destination: "app/icons/test.bin".into(),
+        }]
+    );
+    assert!(pack.replacements.contains_key("app/icons/unmapped.bin"));
+    assert!(
+        !pack
+            .mappings
+            .iter()
+            .any(|mapping| mapping.destination == "app/icons/unmapped.bin"
+                || (mapping.destination.ends_with('/')
+                    && "app/icons/unmapped.bin".starts_with(&mapping.destination)))
+    );
+}
+
+#[test]
+fn preserved_runtime_directory_rule_coexists_with_exact_firmware_exception() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["runtimeFiles"] = json!({"imported/original.bin":{"input":"assets/icon.png"}});
+    let rules = json!([
+        {"source":"/resource/app/", "destination":"imported/"},
+        {"source":"/data/alias.bin", "destination":"imported/original.bin"}
+    ]);
+    config["runtimeMappings"] = rules.clone();
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(
+        pack.mappings[0],
+        corona_core::crpack::Mapping {
+            source: "/resource/app/icons/test.bin".into(),
+            destination: "app/icons/test.bin".into(),
+        }
+    );
+    assert_eq!(serde_json::to_value(&pack.mappings[1..]).unwrap(), rules);
+}
+
+#[test]
+fn runtime_destination_collisions_allow_identical_bytes_but_reject_different_bytes() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["overrides"] = json!({"confirm":{"input":"assets/raw.dat", "mode":"raw"}});
+    config["runtimeFiles"] =
+        json!({"app/icons/test.bin":{"input":"assets/second.dat", "mode":"raw"}});
+    fs::write(directory.path().join("assets/raw.dat"), b"same bytes").unwrap();
+    fs::write(directory.path().join("assets/second.dat"), b"same bytes").unwrap();
+    write_json(&path, &config);
+    let theme = load_theme(directory.path()).unwrap();
+    let built = prepare_target(&theme, "A");
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    assert_eq!(
+        parse_crpack(&built.pack.unwrap())
+            .unwrap()
+            .replacements
+            .len(),
+        1
+    );
+    assert_eq!(built.report.resources.len(), 2);
+    assert_ne!(
+        built.report.resources[0].resource,
+        built.report.resources[1].resource
+    );
+    assert!(
+        built
+            .report
+            .resources
+            .iter()
+            .all(|resource| resource.archive_path.as_deref() == Some("app/icons/test.bin"))
+    );
+    fs::write(
+        directory.path().join("assets/second.dat"),
+        b"different bytes",
+    )
+    .unwrap();
+    let built = prepare_target(&theme, "A");
+    assert!(built.pack.is_none());
+    assert!(built.report.errors.iter().any(|e| e.code == "runtime_asset" && e.message.contains("different replacement bytes")));
+}
+
+#[test]
+fn runtime_validation_collects_per_asset_errors_and_enforces_protocol_rules() {
+    let directory = runtime_project(
+        json!({
+            "a.bin":{"input":"assets/missing"},
+            "b.bin":{"input":"assets"},
+            "c.bin":{"input":"assets/icon.png", "template":"assets/missing"},
+            "../unsafe.bin":{"input":"assets/icon.png"}
+        }),
+        json!([]),
+    );
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert_eq!(
+        built
+            .report
+            .errors
+            .iter()
+            .filter(|e| e.code == "runtime_asset")
+            .count(),
+        4
+    );
+    assert!(built.pack.is_none());
+    for rules in [
+        json!([{"source":"/a", "destination":"custom/"}]),
+        json!([{"source":"/a", "destination":"ok.bin"}, {"source":"/a", "destination":"ok.bin"}]),
+        json!([{"source":"/a/", "destination":"missing/"}]),
+        json!([{"source":"relative", "destination":"ok.bin"}]),
+    ] {
+        let directory = runtime_project(json!({"ok.bin":{"input":"assets/icon.png"}}), rules);
+        let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+        assert!(built.pack.is_none());
+        assert!(
+            built
+                .report
+                .errors
+                .iter()
+                .any(|e| e.code == "pack_validation")
+        );
+    }
+}
+
+#[test]
+fn runtime_input_and_template_reads_are_bounded_and_firmware_is_still_required() {
+    let directory = runtime_project(
+        json!({
+            "large.bin":{"input":"assets/large.dat", "mode":"raw"},
+            "template.bin":{"input":"assets/icon.png", "template":"assets/large.dat"}
+        }),
+        json!([]),
+    );
+    fs::File::create(directory.path().join("assets/large.dat"))
+        .unwrap()
+        .set_len(corona_core::project::MAX_TEMPLATE_BYTES as u64 + 1)
+        .unwrap();
+    let theme = load_theme(directory.path()).unwrap();
+    let built = prepare_target(&theme, "A");
+    assert_eq!(
+        built
+            .report
+            .errors
+            .iter()
+            .filter(|e| e.code == "runtime_asset" && e.message.contains("input limit"))
+            .count(),
+        2
+    );
+    fs::remove_file(directory.path().join("A.bin")).unwrap();
+    let built = prepare_target(&theme, "A");
+    assert_eq!(built.report.errors[0].code, "firmware");
+}
+
+#[test]
+fn runtime_files_share_aggregate_source_and_template_budgets() {
+    for template_mode in [false, true] {
+        let asset = if template_mode {
+            json!({"input":"assets/icon.png", "template":"assets/large.dat"})
+        } else {
+            json!({"input":"assets/large.dat", "mode":"raw"})
+        };
+        let directory = runtime_project(json!({"a.bin":asset.clone(), "b.bin":asset}), json!([]));
+        fs::File::create(directory.path().join("assets/large.dat"))
+            .unwrap()
+            .set_len((corona_core::project::MAX_TEMPLATE_BYTES / 2 + 1) as u64)
+            .unwrap();
+        let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+        assert!(built.pack.is_none());
+        assert!(built.report.errors.iter().any(
+            |e| e.role.as_deref() == Some("runtime:b.bin") && e.message.contains("input limit")
+        ));
+    }
+}
+
+#[test]
+fn runtime_raw_files_share_the_manifest_inclusive_pack_budget() {
+    let directory = runtime_project(
+        json!({"full.bin":{"input":"assets/full.dat", "mode":"raw"}}),
+        json!([]),
+    );
+    fs::File::create(directory.path().join("assets/full.dat"))
+        .unwrap()
+        .set_len(corona_core::project::MAX_TEMPLATE_BYTES as u64)
+        .unwrap();
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(built.pack.is_none());
+    assert!(
+        built
+            .report
+            .errors
+            .iter()
+            .any(|e| e.code == "pack_validation" && e.message.contains("plus corona.json"))
+    );
+}
+
+#[test]
+fn runtime_rules_share_native_rule_counts_and_duplicate_source_validation() {
+    let directory = runtime_project(json!({"icon.bin":{"input":"assets/icon.png"}}), json!([]));
+    let path = directory.path().join("targets/A.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["runtimeMappings"] = json!([{"source":"@quickapp-icon/pkg", "destination":"icon.bin"}]);
+    config["runtimeQuickappIcons"] = json!([{"package":"pkg", "destination":"icon.bin"}]);
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(
+        built
+            .report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("duplicate mapping source"))
+    );
+    config["runtimeMappings"] = json!(
+        (0..256)
+            .map(|i| json!({"source":format!("/data/{i}.bin"), "destination":"icon.bin"}))
+            .collect::<Vec<_>>()
+    );
+    write_json(&path, &config);
+    let built = prepare_target(&load_theme(directory.path()).unwrap(), "A");
+    assert!(
+        built
+            .report
+            .errors
+            .iter()
+            .any(|e| e.message.contains("256"))
+    );
+}
+
+#[test]
+fn proposed_target_config_uses_external_assets_without_project_writes_or_repinning() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let theme = load_theme(directory.path()).unwrap();
+    let saved = corona_core::project::load_target(&theme, "A").unwrap();
+    let pinned = saved.firmware_sha256.clone();
+    let before = snapshot(directory.path());
+    let external = tempfile::tempdir().unwrap();
+    let input = external.path().join("pending.dat");
+    fs::write(&input, b"pending opaque runtime bytes").unwrap();
+    let mut proposed = saved.clone();
+    proposed.runtime_files.insert(
+        "custom/pending.bin".into(),
+        serde_json::from_value(json!({"input":input, "mode":"raw"})).unwrap(),
+    );
+    proposed
+        .runtime_mappings
+        .push(corona_core::crpack::Mapping {
+            source: "/data/new/runtime.bin".into(),
+            destination: "custom/pending.bin".into(),
+        });
+    // This id has no config file; the relative firmware path is still targets/../A.bin.
+    let built = corona_core::project::prepare_target_config(&theme, "pending", &proposed);
+    assert!(built.report.valid, "{:?}", built.report.errors);
+    assert_eq!(
+        built.report.firmware_sha256.as_deref(),
+        Some(pinned.as_str())
+    );
+    let pack = parse_crpack(&built.pack.unwrap()).unwrap();
+    assert_eq!(
+        pack.replacements["custom/pending.bin"],
+        b"pending opaque runtime bytes"
+    );
+    assert_eq!(proposed.firmware_sha256, pinned);
+    assert_eq!(snapshot(directory.path()), before);
+    assert_eq!(
+        corona_core::project::load_target(&theme, "A")
+            .unwrap()
+            .firmware_sha256,
+        pinned
+    );
+    assert!(!directory.path().join("targets/pending.json").exists());
+
+    proposed.firmware_sha256 = "0".repeat(64);
+    let failed = corona_core::project::prepare_target_config(&theme, "pending", &proposed);
+    assert!(failed.pack.is_none());
+    assert_eq!(failed.report.errors[0].code, "firmware");
+    assert!(failed.report.errors[0].message.contains("SHA-256 mismatch"));
+    assert_eq!(snapshot(directory.path()), before);
+
+    proposed.schema_version = 2;
+    let failed = corona_core::project::prepare_target_config(&theme, "pending", &proposed);
+    assert_eq!(failed.report.errors[0].code, "target_config");
+    assert!(failed.report.errors[0].message.contains("schemaVersion"));
+}
+
+#[test]
+fn legacy_target_runtime_fields_default_and_serialize_only_when_nonempty() {
+    let directory = project();
+    target(directory.path(), "A", "icons", &template(2, 2, 0x10), 1);
+    let loaded =
+        corona_core::project::load_target(&load_theme(directory.path()).unwrap(), "A").unwrap();
+    assert!(loaded.runtime_files.is_empty());
+    assert!(loaded.runtime_mappings.is_empty());
+    assert!(loaded.runtime_quickapp_icons.is_empty());
+    let serialized = serde_json::to_value(loaded).unwrap();
+    for key in ["runtimeFiles", "runtimeMappings", "runtimeQuickappIcons"] {
+        assert!(serialized.get(key).is_none());
+    }
+}
+
 #[test]
 fn one_theme_builds_distinct_paths_sizes_and_formats_for_two_firmwares() {
     let directory = project();

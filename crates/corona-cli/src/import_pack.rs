@@ -19,13 +19,16 @@ pub(super) struct Import {
     /// New project directory; it must not already exist.
     #[arg(long)]
     into: PathBuf,
-    /// Firmware whose resource paths the pack replaces.
+    /// Firmware to pin for this target; runtime sources need not exist in it.
     #[arg(long)]
     firmware: PathBuf,
     #[arg(long, default_value = "default")]
     target: String,
     #[arg(long)]
     device: Option<String>,
+    /// Opt into legacy editable firmware bindings instead of preserving archive rules/files.
+    #[arg(long)]
+    normalize_firmware: bool,
 }
 
 fn refuse_existing(path: &Path) -> Result<()> {
@@ -193,6 +196,9 @@ pub(super) fn run(args: Import) -> Result<Value> {
         firmware_path.display()
     );
     let firmware = project::load_firmware(&firmware_path, None)?;
+    if !args.normalize_firmware {
+        return preserve_import(&args, &root, &firmware_path, &firmware, &pack_bytes, &pack);
+    }
     let mappings: Vec<Value> = pack
         .mappings
         .iter()
@@ -508,6 +514,128 @@ pub(super) fn run(args: Import) -> Result<Value> {
         "theme": root.join("theme.json"), "target": args.target, "firmwareSha256": firmware.sha256,
         "mappings": mappings, "quickappIcons":quickapp_declarations,
         "unmapped": unmapped, "resources": resources, "diagnostics": diagnostics
+    }))
+}
+
+/// Preserve authoritative paths and rules without reverse-resolving firmware bindings.
+/// The original ZIP/manifest remain available as evidence; builds preserve archive
+/// files and ordinary rule order, not ZIP compression or unknown manifest fields.
+fn preserve_import(
+    args: &Import,
+    root: &Path,
+    firmware_path: &Path,
+    firmware: &project::LoadedFirmware,
+    pack_bytes: &[u8],
+    pack: &crpack::UnpackedCrpack,
+) -> Result<Value> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| Failure::new("path", "import destination has no parent"))?;
+    let target_path = root.join("targets").join(format!("{}.json", args.target));
+    let firmware_relative = portable_relative(firmware_path, target_path.parent().unwrap())?;
+    // Construct config before creating staging directories. Native declarations are
+    // also authoritative: hashing new destinations would break imported aliases.
+    let mut files = BTreeMap::new();
+    let mut resources = Vec::new();
+    let mut unmapped = Vec::new();
+    for path in pack.replacements.keys() {
+        let input = format!("source/raw/{path}");
+        files.insert(path.clone(), json!({"input":input,"mode":"raw"}));
+        let sources: Vec<_> = pack
+            .mappings
+            .iter()
+            .filter_map(|rule| {
+                suffix(path, &rule.destination).map(|tail| format!("{}{tail}", rule.source))
+            })
+            .chain(
+                pack.quickapp_icons
+                    .iter()
+                    .filter(|icon| icon.destination == *path)
+                    .map(|icon| app_icons::source(&icon.package)),
+            )
+            .collect();
+        if sources.is_empty() {
+            unmapped.push(path.clone());
+        }
+        resources
+            .push(json!({"archivePath":path,"sources":sources,"mode":"raw","origin":"runtime"}));
+    }
+    let mut theme = json!({
+        "schemaVersion":1,"themeId":pack.theme_id,"name":pack.name,"icons":{}
+    });
+    for (key, value) in [
+        ("version", &pack.version),
+        ("author", &pack.author),
+        ("description", &pack.description),
+    ] {
+        if let Some(value) = value {
+            theme[key] = json!(value);
+        }
+    }
+    if let Some(version_code) = pack.version_code {
+        theme["versionCode"] = json!(version_code);
+    }
+    let mut target = json!({
+        "schemaVersion":1,"firmware":firmware_relative,"firmwareSha256":firmware.sha256,
+        "bindings":{},"runtimeFiles":files,"runtimeMappings":pack.mappings,
+        "runtimeQuickappIcons":pack.quickapp_icons
+    });
+    if let Some(device) = args.device.as_deref().or(pack.target.as_deref()) {
+        super::validate_device(Some(device))?;
+        target["device"] = json!(device);
+    }
+    let diagnostics = vec![json!({
+        "code":"mappings_preserved",
+        "message":"Original archive paths, ordered mappings, declarations and all file bytes are retained. Runtime reads are not verified. Use --normalize-firmware to opt into editable firmware bindings."
+    })];
+    let report = json!({
+        "mode":"preserve","mappings":pack.mappings,"quickappIcons":pack.quickapp_icons,
+        "unmapped":unmapped,"resources":resources,"diagnostics":diagnostics
+    });
+    fs::create_dir_all(parent)
+        .map_err(|error| io_failure("could not create import parent", parent, error))?;
+    let stage = tempfile::Builder::new()
+        .prefix(".corona-import-")
+        .tempdir_in(parent)
+        .map_err(|error| io_failure("could not stage import", parent, error))?;
+    let stage_root = stage.path();
+    write_file(stage_root, "source/original.crpack", pack_bytes)?;
+    write_file(stage_root, "source/corona.json", &pack.manifest_bytes)?;
+    for (path, bytes) in &pack.replacements {
+        write_file(stage_root, &format!("source/raw/{path}"), bytes)?;
+    }
+    write_file(stage_root, "theme.json", &json_bytes(&theme)?)?;
+    write_file(
+        stage_root,
+        &format!("targets/{}.json", args.target),
+        &json_bytes(&target)?,
+    )?;
+    write_file(stage_root, "source/import.json", &json_bytes(&report)?)?;
+    for directory in ["assets", "previews"] {
+        let path = stage_root.join(directory);
+        fs::create_dir_all(&path)
+            .map_err(|error| io_failure("could not create import directory", &path, error))?;
+    }
+    eprintln!(
+        "Import: validating {} preserved files before publication",
+        files.len()
+    );
+    let staged_project = project::load_theme(stage_root)?;
+    let prepared = project::prepare_target(&staged_project, &args.target);
+    if !prepared.report.valid {
+        return Err(Failure {
+            code: "validation",
+            message: "preserved project failed validation; destination was not published".into(),
+            details: json!({"targets":[prepared.report],"import":report}),
+        });
+    }
+    refuse_existing(&args.into)?;
+    refuse_existing(root)?;
+    publish_noclobber(stage_root, root)?;
+    Ok(json!({
+        "theme":root.join("theme.json"),"target":args.target,"firmwareSha256":firmware.sha256,
+        "mode":"preserve","mappings":pack.mappings,"quickappIcons":pack.quickapp_icons,
+        "unmapped":unmapped,"resources":resources,"diagnostics":diagnostics
     }))
 }
 

@@ -274,6 +274,8 @@ pub(super) fn run(args: Plan) -> Result<Value> {
         json!({"from":args.from,"target":args.target,"sourceFirmwareSha256":source_firmware.sha256,
         "firmwareSha256":destination_firmware.sha256,"readOnly":true,"requiresConfirmation":true,
         "roles":roles,"unmatched":unmatched,"warnings":warnings,
+        "runtimeMappings":{"from":source.runtime_mappings,"target":destination.runtime_mappings,
+            "automaticAdaptation":false,"note":"Explicit runtime mappings are not inferred from firmware inventories; review and copy them deliberately."},
         "note":"Candidates are advisory. Review semantics, one-to-many slots and size variants before editing bindings; explicitly exclude roles with no valid destination."}),
     )
 }

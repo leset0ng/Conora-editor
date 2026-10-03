@@ -10,6 +10,7 @@ An AstroBox NG API Level 4 Rust/WASM editor and native `corona` CLI for creating
 - Extracts the selected resource in its current state; recognized image resources can also be converted and extracted as PNG.
 - Replaces a selected resource with a PNG converted against its original BIN template (with bidirectional conversion across supported formats), or with arbitrary file bytes.
 - Edits third-party application icons separately from the firmware tree: Canopus uses its exact runtime-path mapping, while QuickApps use package-based `quickappIcons` declarations.
+- Adds custom runtime file rules without requiring the source to exist in firmware. PNGs default to lossless LVGL v9 ARGB8888 at their own dimensions; original BIN templates are optional. Imported rules, aliases, directory mappings and unmapped files are retained.
 - Exports only replaced files plus a root `corona.json` manifest as a `.crpack` ZIP. Imports also accept the legacy root `canora.json`, but reject packs containing both names. Re-export always uses `corona.json`.
 
 PNG conversion keeps the original dimensions and stride. Inputs with the same aspect ratio are automatically scaled up or down to the original dimensions using nearest-neighbor sampling, preserving palette colors and transparent pixels; different aspect ratios are rejected without padding, cropping, or stretching. Same-size inputs are not resampled. PNG inputs are limited to 64 MiB and 16 * 1024 * 1024 pixels. PNGs with more than 256 RGBA colors require opting into lossy quantization. Unsupported BIN formats remain extractable and replaceable as ordinary files, but are not previewed or converted. When a resource has a pending replacement, extraction uses that current replacement; otherwise it extracts the firmware original.
@@ -35,7 +36,20 @@ corona build --theme my-icons --all-targets --output ./packs
 
 For installation from crates.io, use `cargo install corona-cli --locked`. The crate package is `corona-cli`; the installed executable is `corona`. The shared library is published separately as `corona-core`.
 
-Existing packs can be imported with `corona import pack.crpack --into ./theme --firmware firmware.bin --target p67-3.101.043`. `corona plan --theme ./theme --from p67-3.101.043 --target q66-4.100.155` proposes bindings without changing them; `corona preview --theme ./theme --target q66-4.100.155 --verify` previews actual encoded resources and verifies conversion. Explicit target exclusions let one firmware retain icons another firmware cannot use. Native batch operations traverse compressed resources once instead of restarting decompression for every icon.
+Existing packs can be imported with `corona import pack.crpack --into ./theme --firmware firmware.bin --target p67-3.101.043`. Import defaults to preserving original archive paths, ordered rules, application declarations and all file bytes, even when sources are absent from firmware. Use `--normalize-firmware` to opt into the older editable firmware-role workflow. `corona plan --theme ./theme --from p67-3.101.043 --target q66-4.100.155` proposes bindings without changing them; `corona preview --theme ./theme --target q66-4.100.155 --verify` previews actual encoded resources and verifies conversion. Explicit target exclusions let one firmware retain icons another firmware cannot use. Native batch operations traverse compressed resources once instead of restarting decompression for every icon.
+
+### Custom runtime rules
+
+```bash
+# PNGs default to source-dimension LVGL v9 ARGB8888; no template is required.
+corona mapping add --theme ./my-icons --target band11-A \
+  --source /data/custom/icon.bin --input ./icon.png
+corona mapping list --theme ./my-icons --target band11-A --json
+corona mapping remove --theme ./my-icons --target band11-A \
+  --source /data/custom/icon.bin
+```
+
+The package destination is generated automatically; advanced callers may supply `--destination` or an original BIN `--template`. Non-PNG inputs, or inputs explicitly marked `--raw`, are copied unchanged without image validation. Multiple source paths may share a destination. Directory mappings remain supported by import/configuration, while the convenience command focuses on exact files. CLI targets still require pinned firmware, but custom sources are never looked up in its inventory. The editor can author these rules without firmware and retains them when firmware changes. Successful encoding does not establish device compatibility or whether a runtime read actually occurs.
 
 ### Third-party application icons
 

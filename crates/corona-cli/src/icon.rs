@@ -78,7 +78,7 @@ impl IconCommand {
 
 // The theme file is the only replaceable input. Symlink/hardlink aliases to
 // firmware, assets or other config files remain protected even for this write.
-fn config_preflight(path: &Path, protected: &[PathBuf]) -> Result<()> {
+pub(crate) fn config_preflight(path: &Path, protected: &[PathBuf]) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| super::io_failure("could not inspect theme config", path, e))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -90,7 +90,7 @@ fn config_preflight(path: &Path, protected: &[PathBuf]) -> Result<()> {
     super::preflight(path, true, protected)
 }
 
-fn owned_directory(root: &Path, directory: &Path) -> Result<()> {
+pub(crate) fn owned_directory(root: &Path, directory: &Path) -> Result<()> {
     // Never follow a redirected assets subtree, even when it points back into
     // the project. Fresh filenames are published with no-clobber semantics.
     let relative = directory
@@ -191,6 +191,8 @@ fn mutate(
     config_preflight(&config, &protected)?;
     if set.is_none() {
         refuse_target_overrides(&theme, &selector)?;
+    } else {
+        refuse_imported_runtime_icon(&theme, &selector)?;
     }
     let mut value = super::read_json(&config)?;
     let field = if selector.canopus {
@@ -292,6 +294,76 @@ fn mutate(
         json!({"theme":config, "kind":if selector.canopus {"canopus"} else {"quickapp"},
         "package":package, "asset":asset, "removed":removed, "copiedAssets":published}),
     )
+}
+
+/// Imported native sources retain target-local destinations. Adding a new
+/// shared declaration would duplicate those sources and invalidate every build.
+fn refuse_imported_runtime_icon(theme: &project::ThemeProject, selector: &Selector) -> Result<()> {
+    let source = selector
+        .package
+        .as_deref()
+        .map(corona_core::app_icons::source)
+        .unwrap_or_else(|| corona_core::app_icons::CANOPUS_SOURCE.into());
+    let destination = selector
+        .package
+        .as_deref()
+        .map(corona_core::app_icons::destination)
+        .unwrap_or_else(|| corona_core::app_icons::CANOPUS_DESTINATION.into());
+    let directory = theme.root.join("targets");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(super::io_failure(
+                "could not inspect imported icons",
+                &directory,
+                error,
+            ));
+        }
+    };
+    let mut owners = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                super::io_failure("could not inspect imported icons", &directory, error)
+            })?
+            .path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let value = super::read_json(&path)?;
+        let ordinary = value["runtimeMappings"].as_array().is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule["source"].as_str() == Some(source.as_str()))
+        });
+        let declaration = value["runtimeQuickappIcons"]
+            .as_array()
+            .is_some_and(|icons| {
+                icons.iter().any(|icon| {
+                    icon["package"].as_str() == selector.package.as_deref()
+                        && selector.package.is_some()
+                })
+            });
+        let destination_owned = value["runtimeFiles"].get(&destination).is_some();
+        if ordinary || declaration || destination_owned {
+            owners.push(
+                json!({"target":path.file_stem().and_then(|name|name.to_str()),
+                "config":super::path_text(&path)?,"sourceMapped":ordinary || declaration,
+                "destinationDeclared":destination_owned}),
+            );
+        }
+    }
+    if owners.is_empty() {
+        return Ok(());
+    }
+    owners.sort_by_key(|owner| owner["target"].as_str().unwrap_or("").to_owned());
+    let mut error = Failure::new(
+        "runtime_owned_icon",
+        "this icon source or destination is owned by target runtime files; use mapping add --force for an existing imported rule, or remove its rule and conflicting runtimeFiles declaration before declaring a shared icon",
+    );
+    error.details = json!({"source":source,"destination":destination,"runtimeOwners":owners});
+    Err(error)
 }
 
 /// Removing a shared declaration must not orphan target-specific overrides.

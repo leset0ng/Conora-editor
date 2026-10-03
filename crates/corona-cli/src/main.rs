@@ -12,6 +12,7 @@ use tempfile::NamedTempFile;
 mod adapt;
 mod icon;
 mod import_pack;
+mod mapping;
 mod preview;
 
 #[derive(Parser)]
@@ -41,6 +42,11 @@ enum Command {
     Icon {
         #[command(subcommand)]
         command: icon::IconCommand,
+    },
+    /// Manage arbitrary runtime files and ordered filesystem mappings.
+    Mapping {
+        #[command(subcommand)]
+        command: mapping::MappingCommand,
     },
     /// List resources in a firmware.
     Ls(List),
@@ -230,6 +236,7 @@ fn main() -> ExitCode {
         Command::Init(_) => "init",
         Command::Target { .. } => "target add",
         Command::Icon { command } => command.name(),
+        Command::Mapping { command } => command.name(),
         Command::Ls(_) => "ls",
         Command::Extract(_) => "extract",
         Command::Check(_) => "check",
@@ -366,6 +373,7 @@ fn run(command: Command) -> Result<Value> {
             command: TargetCommand::Add(args),
         } => target_add(args),
         Command::Icon { command } => icon::run(command),
+        Command::Mapping { command } => mapping::run(command),
         Command::Ls(args) => list(args),
         Command::Extract(args) => extract(args),
         Command::Check(args) => check_build(args, None),
@@ -496,14 +504,34 @@ fn target_add(args: TargetAdd) -> Result<Value> {
     protected.push(theme_input(&args.theme, &project));
     protected.push(absolute(&args.firmware)?);
     preflight(&destination, args.force, &protected)?;
-    let value = target_json(
+    let mut value = target_json(
         &args.firmware,
         destination.parent().unwrap(),
         &loaded.sha256,
         args.device.as_deref(),
     )?;
+    if args.force && destination.exists() {
+        // Strictly load the previous config: malformed declarations must not
+        // silently disappear during a firmware switch. Only firmware bindings
+        // and overrides reset; the independent runtime lane survives.
+        let previous = project::load_target(&project, &args.id)?;
+        let previous =
+            serde_json::to_value(previous).map_err(|e| Failure::new("json", e.to_string()))?;
+        for field in ["runtimeFiles", "runtimeMappings", "runtimeQuickappIcons"] {
+            if let Some(declaration) = previous.get(field) {
+                value[field] = declaration.clone();
+            }
+        }
+    }
+    let bytes = json_bytes(&value)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(Failure::new(
+            "config_size",
+            "updated target config exceeds the 1 MiB limit",
+        ));
+    }
     make_dir(destination.parent().unwrap())?;
-    let staged = stage(&destination, &json_bytes(&value)?)?;
+    let staged = stage(&destination, &bytes)?;
     commit(staged, &destination, args.force)?;
     Ok(json!({ "target": args.id, "config": destination, "firmwareSha256": loaded.sha256 }))
 }
@@ -750,10 +778,15 @@ fn check_build(selection: Selection, build: Option<(Option<PathBuf>, bool)>) -> 
                 last_progress = std::time::Instant::now();
             }
         });
-        reports.push(
-            serde_json::to_value(&prepared.report)
-                .map_err(|e| Failure::new("json", e.to_string()))?,
-        );
+        let mut report = serde_json::to_value(&prepared.report)
+            .map_err(|e| Failure::new("json", e.to_string()))?;
+        if let Ok(target) = project::load_target(&project, id) {
+            // Declaration counts are not claims about device compatibility.
+            report["runtimeFileCount"] = json!(target.runtime_files.len());
+            report["runtimeMappingCount"] = json!(target.runtime_mappings.len());
+            report["runtimeQuickappIconCount"] = json!(target.runtime_quickapp_icons.len());
+        }
+        reports.push(report);
         invalid |= !prepared.report.valid || prepared.pack.is_none();
         if let Some((output, _, destinations)) = &outputs
             && !invalid
@@ -1071,6 +1104,7 @@ fn project_inputs(
         }
         collect_assets(&config["overrides"], &project.root, &mut inputs);
         icon::collect_inputs(&config, &project.root, &mut inputs);
+        mapping::collect_inputs(&config, &project.root, &mut inputs);
     }
     Ok(inputs)
 }
